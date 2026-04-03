@@ -44,6 +44,7 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
 - the newest shell pass replaced the transcript document box with message-style conversation cards so the session reads more like a real client conversation
 - the latest shell pass replaced the Codex CLI proof markdown slab with a structured proof panel that surfaces availability, session, artifacts, and recent CLI events more directly
 - the newest shell pass added direct keyboard interaction to the workbench: send prompt, start loop, and clear draft are now first-class operator actions
+- the newest session-lane pass made assistant reply cards actionable: `Use as Draft` now feeds the composer directly from the transcript
 
 ## Immediate Next Action
 

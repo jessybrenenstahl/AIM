@@ -48,12 +48,16 @@ Completed in this slice:
    - `Ctrl+Enter` / `Cmd+Enter` sends the prompt
    - `Ctrl+Shift+Enter` / `Cmd+Shift+Enter` starts the loop
    - the composer now exposes a direct `Clear Draft` affordance and interaction hint inline
+13. Made the session lane directly reusable:
+   - assistant reply cards now expose `Use as Draft`
+   - session-card interaction now feeds the composer without leaving the transcript lane
+   - the workbench is starting to behave more like a real client instead of a read-only conversation viewer
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
    - keep reducing the remaining stacked dashboard-card behavior
-   - make the session lane more live and interactive beyond keyboard shortcuts and static message cards
+   - make the session lane more live and interactive beyond keyboard shortcuts and draft reuse
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift

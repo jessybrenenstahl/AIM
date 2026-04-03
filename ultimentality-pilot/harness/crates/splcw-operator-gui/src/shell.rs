@@ -559,6 +559,17 @@ impl OperatorShell {
         cx.notify();
     }
 
+    fn set_objective_draft(
+        &mut self,
+        draft: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        set_input_value(&self.objective_input, draft.into(), window, cx);
+        self.sync_form_into_state(cx);
+        cx.notify();
+    }
+
     fn select_auth_provider(&mut self, provider: OperatorAuthProvider, cx: &mut Context<Self>) {
         self.app.auth_provider = provider;
         cx.notify();
@@ -601,6 +612,150 @@ impl OperatorShell {
             cx,
         );
         cx.notify();
+    }
+
+    fn render_conversation_surface(
+        &self,
+        entries: &[ConversationEntry],
+        min_height_rem: f32,
+        max_height_rem: Option<f32>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .children(entries.iter().enumerate().map(|(index, entry)| {
+                self.render_conversation_entry(&format!("operate-conversation-{index}"), entry, cx)
+            }));
+
+        div()
+            .w_full()
+            .min_w_0()
+            .min_h(rems(min_height_rem))
+            .rounded_md()
+            .border_1()
+            .border_color(shell_chip_border())
+            .bg(shell_chip_bg())
+            .p_3()
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .max_h(rems(max_height_rem.unwrap_or(min_height_rem + 8.0)))
+                    .overflow_y_scrollbar()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn render_conversation_entry(
+        &self,
+        id: &str,
+        entry: &ConversationEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (role_label, bubble_bg, role_bg, role_fg, justify_end) = match entry.role {
+            ConversationRole::User => (
+                "You",
+                shell_user_bubble(),
+                gpui::rgb(0x245c9c).into(),
+                shell_text(),
+                true,
+            ),
+            ConversationRole::Assistant => (
+                "Codex",
+                shell_assistant_bubble(),
+                gpui::rgb(0x1d3d63).into(),
+                shell_text(),
+                false,
+            ),
+        };
+        let copy_body = entry.body.clone();
+        let draft_body = entry.body.clone();
+        let actions = {
+            let copy_button = Button::new(SharedString::from(format!("{id}-copy")))
+                .label("Copy")
+                .ghost()
+                .compact()
+                .disabled(copy_body.trim().is_empty())
+                .on_click(move |_, _, app| {
+                    app.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
+                })
+                .into_any_element();
+            match entry.role {
+                ConversationRole::Assistant => h_flex()
+                    .gap_2()
+                    .children([
+                        Button::new(SharedString::from(format!("{id}-draft")))
+                            .label("Use as Draft")
+                            .ghost()
+                            .compact()
+                            .disabled(draft_body.trim().is_empty())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_objective_draft(draft_body.clone(), window, cx);
+                            }))
+                            .into_any_element(),
+                        copy_button,
+                    ])
+                    .into_any_element(),
+                ConversationRole::User => copy_button,
+            }
+        };
+
+        let bubble = v_flex()
+            .gap_3()
+            .max_w(px(980.0))
+            .w_full()
+            .min_w_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(shell_chip_border())
+            .bg(bubble_bg)
+            .p_4()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(status_pill(role_label, role_bg, role_fg))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(shell_text())
+                                    .child(entry.title.clone()),
+                            ),
+                    )
+                    .child(actions),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .children(entry.body.lines().map(render_document_line)),
+            );
+
+        if justify_end {
+            h_flex()
+                .w_full()
+                .justify_end()
+                .child(bubble)
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .justify_start()
+                .child(bubble)
+                .into_any_element()
+        }
     }
 
     fn render_header(
@@ -1155,14 +1310,12 @@ impl OperatorShell {
                                                 .bg(shell_border()),
                                         )
                                         .child(
-                                            conversation_surface(
-                                                "operate-conversation",
+                                            self.render_conversation_surface(
                                                 &build_conversation_entries(
                                                     self.app.engine_mode,
                                                     snapshot,
                                                     &prompt_draft,
                                                 ),
-                                                self.zoom_scale,
                                                 28.0,
                                                 Some(52.0),
                                                 window,
@@ -2426,126 +2579,6 @@ fn document_surface(
     };
 
     container.child(content).into_any_element()
-}
-
-fn conversation_surface(
-    id: impl Into<SharedString>,
-    entries: &[ConversationEntry],
-    zoom_scale: f32,
-    min_height_rem: f32,
-    max_height_rem: Option<f32>,
-    window: &mut Window,
-    cx: &mut Context<OperatorShell>,
-) -> AnyElement {
-    let id: SharedString = id.into();
-    let _ = (zoom_scale, window, cx);
-    let body = v_flex()
-        .w_full()
-        .min_w_0()
-        .gap_3()
-        .children(entries.iter().enumerate().map(|(index, entry)| {
-            render_conversation_entry(&format!("{id}-{index}"), entry)
-        }));
-
-    div()
-        .w_full()
-        .min_w_0()
-        .min_h(rems(min_height_rem))
-        .rounded_md()
-        .border_1()
-        .border_color(shell_chip_border())
-        .bg(shell_chip_bg())
-        .p_3()
-        .overflow_hidden()
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .min_h_0()
-                .max_h(rems(max_height_rem.unwrap_or(min_height_rem + 8.0)))
-                .overflow_y_scrollbar()
-                .child(body),
-        )
-        .into_any_element()
-}
-
-fn render_conversation_entry(id: &str, entry: &ConversationEntry) -> AnyElement {
-    let (role_label, bubble_bg, role_bg, role_fg, justify_end) = match entry.role {
-        ConversationRole::User => (
-            "You",
-            shell_user_bubble(),
-            gpui::rgb(0x245c9c).into(),
-            shell_text(),
-            true,
-        ),
-        ConversationRole::Assistant => (
-            "Codex",
-            shell_assistant_bubble(),
-            gpui::rgb(0x1d3d63).into(),
-            shell_text(),
-            false,
-        ),
-    };
-    let copy_body = entry.body.clone();
-    let bubble = v_flex()
-        .gap_3()
-        .max_w(px(980.0))
-        .w_full()
-        .min_w_0()
-        .rounded_lg()
-        .border_1()
-        .border_color(shell_chip_border())
-        .bg(bubble_bg)
-        .p_4()
-        .child(
-            h_flex()
-                .justify_between()
-                .items_start()
-                .gap_3()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(status_pill(role_label, role_bg, role_fg))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(shell_text())
-                                .child(entry.title.clone()),
-                        ),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("{id}-copy")))
-                        .label("Copy")
-                        .ghost()
-                        .compact()
-                        .disabled(copy_body.trim().is_empty())
-                        .on_click(move |_, _, app| {
-                            app.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
-                        }),
-                ),
-        )
-        .child(
-            v_flex()
-                .w_full()
-                .min_w_0()
-                .gap_1()
-                .children(entry.body.lines().map(render_document_line)),
-        );
-
-    if justify_end {
-        h_flex()
-            .w_full()
-            .justify_end()
-            .child(bubble)
-            .into_any_element()
-    } else {
-        h_flex()
-            .w_full()
-            .justify_start()
-            .child(bubble)
-            .into_any_element()
-    }
 }
 
 fn optional_button(
