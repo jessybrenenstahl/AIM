@@ -1012,6 +1012,22 @@ impl OperatorShell {
                         ),
                 )
                 .child(card(
+                    "Prompt Grounding",
+                    Some(
+                        "This is the operating-memory bundle prepended to Codex CLI turns so the model is grounded in AIM's canonical memory and continuity surfaces.",
+                    ),
+                    document_surface(
+                        "operate-prompt-grounding",
+                        build_prompt_grounding_markdown(self.app.engine_mode, snapshot),
+                        self.zoom_scale,
+                        18.0,
+                        Some(32.0),
+                        DocumentSurfaceMode::Scroll,
+                        window,
+                        cx,
+                    ),
+                ))
+                .child(card(
                     "Session Settings",
                     Some("These controls stay available, but they should read like workspace setup rather than a dashboard form."),
                     h_flex()
@@ -2575,6 +2591,28 @@ fn build_operate_status_markdown(
         }
     }
     format!("# Live Status\n\n{}", lines.join("\n"))
+}
+
+fn build_prompt_grounding_markdown(
+    engine_mode: OperatorEngineMode,
+    snapshot: &OperatorSnapshot,
+) -> String {
+    let intro = match engine_mode {
+        OperatorEngineMode::CodexCli =>
+            "The primary CLI lane gets this bundle directly in the turn prompt before the current objective.",
+        OperatorEngineMode::NativeHarness =>
+            "This bundle shows the canonical operating memory AIM expects the runtime to use, even while the provider fallback lane is active.",
+    };
+
+    match snapshot.runtime_grounding_bundle.as_deref() {
+        Some(bundle) if !bundle.trim().is_empty() => {
+            format!("# Prompt Grounding\n\n{}\n\n{}", intro, bundle.trim())
+        }
+        _ => format!(
+            "# Prompt Grounding\n\n{}\n\n- Operating-memory bundle is not available yet.",
+            intro
+        ),
+    }
 }
 
 fn provider_retry_needed(snapshot: &OperatorSnapshot) -> bool {

@@ -636,6 +636,7 @@ struct OperatorSnapshot {
     current_plan: Option<String>,
     current_open_gaps: Option<String>,
     current_handoff: Option<String>,
+    runtime_grounding_bundle: Option<String>,
 }
 
 struct HarnessController {
@@ -1258,7 +1259,9 @@ impl HarnessController {
         let session_dir = self.paths.session_root.join(&self.paths.session_id);
         fs::create_dir_all(&session_dir)
             .with_context(|| format!("create session dir {}", session_dir.display()))?;
-        let prompt = build_codex_cli_context_prompt(&self.paths, settings.objective.as_str());
+        let grounding_bundle = build_runtime_grounding_bundle(&self.paths)?;
+        let prompt =
+            build_codex_cli_context_prompt(&self.paths, settings.objective.as_str(), grounding_bundle.as_deref());
         let previous_session =
             read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
         let mut args = if let Some(previous_session) = previous_session.as_ref() {
@@ -1740,6 +1743,7 @@ impl HarnessController {
                     .join("current")
                     .join("handoff.md"),
             )?,
+            runtime_grounding_bundle: build_runtime_grounding_bundle(&self.paths)?,
         };
         self.persist_snapshot(&snapshot)?;
         Ok(snapshot)
@@ -5405,30 +5409,124 @@ struct ParsedCodexCliExecOutput {
     warning_lines: Vec<String>,
 }
 
-fn build_codex_cli_context_prompt(paths: &OperatorPaths, objective: &str) -> String {
+fn append_grounding_section(
+    sections: &mut Vec<String>,
+    label: &str,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    if let Some(body) = read_text_if_exists(path.clone())? {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!(
+                "## {label}\nsource: {}\n\n{}",
+                path.display(),
+                trimmed
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_runtime_grounding_bundle(paths: &OperatorPaths) -> anyhow::Result<Option<String>> {
+    let mut sections = Vec::new();
+
+    append_grounding_section(
+        &mut sections,
+        "Operating System Context",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("memory")
+            .join("os.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Working Memory",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("memory")
+            .join("memory.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Baseline Recovery Context",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("baseline")
+            .join("clean-splcw-harness-2026-04-03.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Current Plan",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("current-plan.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Current Brief",
+        paths.repo_root.join("offload").join("current").join("brief.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Current Plan Mirror",
+        paths.repo_root.join("offload").join("current").join("plan.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Current Open Gaps",
+        paths.repo_root.join("offload").join("current").join("open-gaps.md"),
+    )?;
+    append_grounding_section(
+        &mut sections,
+        "Current Handoff",
+        paths.repo_root.join("offload").join("current").join("handoff.md"),
+    )?;
+
+    if let Some(repo_context) = build_repo_git_context(paths) {
+        sections.push(repo_context);
+    }
+    if let Some(github_context) = build_github_cli_context(paths) {
+        sections.push(github_context);
+    }
+
+    if sections.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sections.join("\n\n")))
+    }
+}
+
+fn build_codex_cli_context_prompt(
+    paths: &OperatorPaths,
+    objective: &str,
+    grounding_bundle: Option<&str>,
+) -> String {
+    let grounding = grounding_bundle.unwrap_or(
+        "Grounding bundle unavailable. Rehydrate manually from artifacts/ultimentality-pilot/memory/, artifacts/ultimentality-pilot/current-plan.md, and offload/current/ before acting.",
+    );
     format!(
         "You are Codex running inside the AGRO / AIM repo at `{}`.\n\
 \n\
-Before acting, rehydrate from these canonical files:\n\
+Treat the following operating-memory bundle as already loaded for this turn. Use it before replying, and prefer grounded use of the existing host, verification, memory, and orchestrator tools over generic repo chatter.\n\
+\n\
+# Operating Memory Bundle\n\
+\n\
+{}\n\
+\n\
+# Additional Reference Files\n\
+\n\
 - `README.md`\n\
 - `ultimentality-pilot/harness/ARCHITECTURE.md`\n\
-- `artifacts/ultimentality-pilot/baseline/clean-splcw-harness-2026-04-03.md`\n\
-- `artifacts/ultimentality-pilot/memory/os.md`\n\
-- `artifacts/ultimentality-pilot/memory/memory.md`\n\
 - `artifacts/ultimentality-pilot/roadmap.md`\n\
-- `artifacts/ultimentality-pilot/current-plan.md`\n\
-- `offload/current/brief.md`\n\
-- `offload/current/plan.md`\n\
-- `offload/current/open-gaps.md`\n\
-- `offload/current/handoff.md`\n\
-\n\
-Treat those files as always-on operating memory for this session instead of improvising from a thin summary.\n\
-\n\
-Use the memory surfaces and continuity artifacts before replying. Prefer grounded use of the existing host, verification, memory, and orchestrator tools over generic repo chatter.\n\
 \n\
 Current objective:\n\
 {}\n",
         paths.repo_root.display(),
+        grounding,
         normalize_text(objective, DEFAULT_OBJECTIVE)
     )
 }
@@ -7888,9 +7986,11 @@ mod tests {
         background_runner_allows_spawn, background_runner_owner_shell_alive,
         background_runner_process_is_alive, bootstrap_background_runner_state,
         browser_callback_bind_target, build_browser_callback_url, build_github_action_command,
-        build_github_cli_context_from, build_github_target_guidance,
-        build_github_target_suggestions_from, build_pending_oauth_view,
-        build_project_artifact_context, build_repo_git_context_from, classify_background_handoff,
+        build_codex_cli_context_prompt, build_github_cli_context_from,
+        build_github_target_guidance, build_github_target_suggestions_from,
+        build_pending_oauth_view, build_project_artifact_context,
+        build_repo_git_context_from, build_runtime_grounding_bundle,
+        classify_background_handoff,
         classify_background_runner, combine_optional_notices, describe_auth_state,
         describe_operator_auth_state,
         discover_codex_command_with, discover_openclaw_command_with, discover_repo_root,
@@ -9972,6 +10072,103 @@ mod tests {
         assert!(context.contains("## Current Handoff"));
         assert!(context.contains("handoff body"));
         Ok(())
+    }
+
+    #[test]
+    fn build_runtime_grounding_bundle_reads_memory_and_continuity_surfaces()
+    -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let repo_root = root.path().join("repo");
+        fs::create_dir_all(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("memory"),
+        )?;
+        fs::create_dir_all(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("baseline"),
+        )?;
+        fs::create_dir_all(repo_root.join("offload").join("current"))?;
+        fs::create_dir_all(repo_root.join("ultimentality-pilot").join("harness"))?;
+        fs::create_dir_all(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("operator"),
+        )?;
+
+        fs::write(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("memory")
+                .join("os.md"),
+            "# OS\nwindows body\n",
+        )?;
+        fs::write(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("memory")
+                .join("memory.md"),
+            "# Memory\nworking set\n",
+        )?;
+        fs::write(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("baseline")
+                .join("clean-splcw-harness-2026-04-03.md"),
+            "# Baseline\nclean baseline\n",
+        )?;
+        fs::write(
+            repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("current-plan.md"),
+            "# Current Plan\nactive work\n",
+        )?;
+        fs::write(
+            repo_root.join("offload").join("current").join("plan.md"),
+            "# Plan\nmirror plan\n",
+        )?;
+        fs::write(
+            repo_root.join("offload").join("current").join("open-gaps.md"),
+            "# Open Gaps\nlead gap\n",
+        )?;
+        fs::write(
+            repo_root.join("offload").join("current").join("handoff.md"),
+            "# Handoff\nnext step\n",
+        )?;
+
+        let paths = test_operator_paths(&repo_root);
+        let bundle = build_runtime_grounding_bundle(&paths)?
+            .context("expected runtime grounding bundle")?;
+
+        assert!(bundle.contains("## Operating System Context"));
+        assert!(bundle.contains("windows body"));
+        assert!(bundle.contains("## Working Memory"));
+        assert!(bundle.contains("working set"));
+        assert!(bundle.contains("## Current Open Gaps"));
+        assert!(bundle.contains("lead gap"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_codex_cli_context_prompt_embeds_grounding_bundle() {
+        let paths = test_operator_paths(Path::new(r"C:\repo"));
+        let prompt = build_codex_cli_context_prompt(
+            &paths,
+            "Do the next grounded step",
+            Some("## Working Memory\nsource: memory.md\n\nmemory body"),
+        );
+
+        assert!(prompt.contains("# Operating Memory Bundle"));
+        assert!(prompt.contains("memory body"));
+        assert!(prompt.contains("Current objective:\nDo the next grounded step"));
     }
 
     #[test]
