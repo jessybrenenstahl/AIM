@@ -631,7 +631,7 @@ impl OperatorShell {
                                     .text_xs()
                                     .font_semibold()
                                     .text_color(gpui::rgb(0x6eb6ff))
-                                    .child("NATIVE OPERATOR SHELL"),
+                                    .child("CLI-FIRST OPERATOR WORKBENCH"),
                             )
                             .child(
                                 div()
@@ -644,31 +644,42 @@ impl OperatorShell {
                                 div()
                                     .text_sm()
                                     .text_color(shell_muted_text())
-                                    .child(self.selected_panel.description()),
+                                    .child(format!(
+                                        "{}  |  {}",
+                                        self.selected_panel.title(),
+                                        self.selected_panel.description()
+                                    )),
                             ),
                     )
                     .child(h_flex().gap_2().flex_wrap().justify_end().children(pills)),
             )
             .child(
-                h_flex().gap_3().flex_wrap().children([
-                    metadata_chip("Run state", &snapshot.run_state, cx),
-                    metadata_chip("Mode", &snapshot.run_mode, cx),
-                    metadata_chip(
-                        "Refreshed",
-                        snapshot
-                            .refreshed_at
-                            .map(|value| value.to_rfc3339())
-                            .as_deref()
-                            .unwrap_or("not yet"),
-                        cx,
-                    ),
-                    metadata_chip(
-                        "Completed turns",
-                        &snapshot.completed_turn_count.to_string(),
-                        cx,
-                    ),
-                    metadata_chip("Zoom", &format!("{}%", self.zoom_percent()), cx),
-                ]),
+                {
+                    let mut chips = vec![
+                        metadata_chip("Run state", &snapshot.run_state, cx),
+                        metadata_chip("Mode", &snapshot.run_mode, cx),
+                        metadata_chip("Panel", self.selected_panel.title(), cx),
+                        metadata_chip(
+                            "Refreshed",
+                            snapshot
+                                .refreshed_at
+                                .map(|value| value.to_rfc3339())
+                                .as_deref()
+                                .unwrap_or("not yet"),
+                            cx,
+                        ),
+                        metadata_chip(
+                            "Completed turns",
+                            &snapshot.completed_turn_count.to_string(),
+                            cx,
+                        ),
+                        metadata_chip("Zoom", &format!("{}%", self.zoom_percent()), cx),
+                    ];
+                    if let Some(session_id) = snapshot.codex_cli_session_id.as_deref() {
+                        chips.push(metadata_chip("CLI session", session_id, cx));
+                    }
+                    h_flex().gap_3().flex_wrap().children(chips)
+                },
             )
             .child(
                 h_flex()
@@ -723,7 +734,15 @@ impl OperatorShell {
             self.nav_item(OperatorPanel::Artifacts, None, cx),
             self.nav_item(
                 OperatorPanel::Activity,
-                Some(snapshot.recent_events.len() + snapshot.recent_turns.len()),
+                Some(match self.app.engine_mode {
+                    OperatorEngineMode::CodexCli => {
+                        snapshot.codex_cli_recent_events.len()
+                            + snapshot.codex_cli_recent_turn_replies.len()
+                    }
+                    OperatorEngineMode::NativeHarness => {
+                        snapshot.recent_events.len() + snapshot.recent_turns.len()
+                    }
+                }),
                 cx,
             ),
         ];
@@ -749,11 +768,11 @@ impl OperatorShell {
                             .text_sm()
                             .font_semibold()
                             .text_color(shell_text())
-                            .child("Control Surface"),
+                            .child("CLI Workbench"),
                     )
                     .child(
                         div().text_xs().text_color(shell_muted_text()).child(
-                            "Readable, scrollable, and explicit about what engine is running.",
+                            "Transcript-first operator shell for the live Codex session, grounding, and runtime proofs.",
                         ),
                     ),
             )
@@ -3101,7 +3120,7 @@ fn build_conversation_markdown(
                 .to_string(),
         );
     } else {
-        for reply in replies.iter().rev() {
+        for reply in replies {
             sections.push(reply.clone());
         }
     }

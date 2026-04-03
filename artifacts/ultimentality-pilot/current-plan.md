@@ -28,6 +28,10 @@ Completed in this slice:
    - widened the 4K work surface
    - improved reply rendering for quotes, numbered steps, and fenced blocks
    - pushed the Operate page further toward a transcript/proof workbench instead of a thin admin dashboard
+8. Tightened interaction polish:
+   - conversation now renders in chronological order instead of newest-first inversion
+   - sidebar/header language now describe a CLI workbench instead of a generic control surface
+   - top-level session chips now expose the live CLI session more directly
 
 ### Immediate Next Work
 

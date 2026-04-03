@@ -39,6 +39,7 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - plus live repo/GitHub context when available
 - the Operate page now surfaces that same grounding bundle in a visible `Prompt Grounding` pane
 - the latest shell pass widened the main work surface and improved document rendering so replies with quotes, numbered steps, and fenced blocks survive the GUI more faithfully
+- the next shell pass made the session chronology read naturally again and exposed the live CLI session more directly in the top-level workbench metadata
 
 ## Immediate Next Action
 
