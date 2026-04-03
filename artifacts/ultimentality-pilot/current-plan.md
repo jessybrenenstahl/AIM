@@ -40,6 +40,10 @@ Completed in this slice:
    - Codex replies now render as individual conversation cards
    - prompt drafts render as a distinct `You` message
    - each message can be copied directly from the session lane
+11. Replaced the Codex CLI proof markdown block with a structured proof panel:
+   - explicit availability/login/session evidence chips
+   - artifact-backed path surface for the session file, turn log, and status snapshot
+   - recent CLI event evidence stays visible without burying it in one big markdown slab
 
 ### Immediate Next Work
 

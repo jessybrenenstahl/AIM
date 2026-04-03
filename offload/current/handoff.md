@@ -42,6 +42,7 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
 - the next shell pass made the session chronology read naturally again and exposed the live CLI session more directly in the top-level workbench metadata
 - the latest shell pass merged composer, run controls, and session settings into one continuous session workspace so Operate reads less like separate dashboard cards
 - the newest shell pass replaced the transcript document box with message-style conversation cards so the session reads more like a real client conversation
+- the latest shell pass replaced the Codex CLI proof markdown slab with a structured proof panel that surfaces availability, session, artifacts, and recent CLI events more directly
 
 ## Immediate Next Action
 

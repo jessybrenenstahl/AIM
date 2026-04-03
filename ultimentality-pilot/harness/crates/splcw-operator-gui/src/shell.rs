@@ -1112,19 +1112,13 @@ impl OperatorShell {
                                     Some(
                                         "This is the proof pane for what engine is actually driving the session.",
                                     ),
-                                    document_surface(
-                                        "engine-identity",
-                                        build_engine_identity_markdown(
-                                            &self.app.controller.paths,
-                                            self.app.engine_mode,
-                                            self.app.auth_provider,
-                                            snapshot,
-                                            &self.app.settings,
-                                        ),
+                                    render_connection_panel(
+                                        &self.app.controller.paths,
+                                        self.app.engine_mode,
+                                        self.app.auth_provider,
+                                        snapshot,
+                                        &self.app.settings,
                                         self.zoom_scale,
-                                        10.0,
-                                        Some(16.0),
-                                        DocumentSurfaceMode::Scroll,
                                         window,
                                         cx,
                                     ),
@@ -2578,6 +2572,193 @@ fn artifact_card(
         ),
     )
     .into_any_element()
+}
+
+fn render_connection_panel(
+    paths: &OperatorPaths,
+    engine_mode: OperatorEngineMode,
+    provider: OperatorAuthProvider,
+    snapshot: &OperatorSnapshot,
+    settings: &RunSettings,
+    zoom_scale: f32,
+    window: &mut Window,
+    cx: &mut Context<OperatorShell>,
+) -> AnyElement {
+    match engine_mode {
+        OperatorEngineMode::CodexCli => render_codex_cli_connection_panel(
+            paths, snapshot, settings, zoom_scale, window, cx,
+        ),
+        OperatorEngineMode::NativeHarness => document_surface(
+            "engine-identity",
+            build_engine_identity_markdown(paths, engine_mode, provider, snapshot, settings),
+            zoom_scale,
+            10.0,
+            Some(16.0),
+            DocumentSurfaceMode::Scroll,
+            window,
+            cx,
+        ),
+    }
+}
+
+fn render_codex_cli_connection_panel(
+    paths: &OperatorPaths,
+    snapshot: &OperatorSnapshot,
+    settings: &RunSettings,
+    zoom_scale: f32,
+    window: &mut Window,
+    cx: &mut Context<OperatorShell>,
+) -> AnyElement {
+    let session_turn_log = paths
+        .session_root
+        .join(&paths.session_id)
+        .join("codex-cli-turn-log.jsonl");
+    let latest_completed = snapshot
+        .codex_cli_recent_events
+        .iter()
+        .rev()
+        .find(|event| event.contains("turn.completed"))
+        .cloned()
+        .or_else(|| snapshot.codex_cli_last_turn_summary.clone())
+        .unwrap_or_else(|| "No completed Codex CLI turn recorded yet.".to_string());
+    let recent_events = if snapshot.codex_cli_recent_events.is_empty() {
+        "No CLI session events recorded yet.".to_string()
+    } else {
+        snapshot
+            .codex_cli_recent_events
+            .iter()
+            .rev()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|event| format!("- {event}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let artifact_paths = format!(
+        "- **Command path:** `{}`\n- **Session artifact:** `{}`\n- **Turn log artifact:** `{}`\n- **Status artifact:** `{}`",
+        snapshot
+            .codex_cli_command_path
+            .as_deref()
+            .unwrap_or("not recorded"),
+        paths.codex_cli_session_path.display(),
+        session_turn_log.display(),
+        paths.status_path.display()
+    );
+
+    v_flex()
+        .gap_3()
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .children([
+                    status_pill(
+                        CLI_CODEX_ENGINE_LABEL,
+                        gpui::rgb(0x245c9c).into(),
+                        shell_text(),
+                    ),
+                    status_pill(
+                        if snapshot.codex_cli_available {
+                            "CLI Available"
+                        } else {
+                            "CLI Missing"
+                        },
+                        if snapshot.codex_cli_available {
+                            cx.theme().success
+                        } else {
+                            cx.theme().danger
+                        },
+                        if snapshot.codex_cli_available {
+                            cx.theme().success_foreground
+                        } else {
+                            cx.theme().danger_foreground
+                        },
+                    ),
+                    status_pill(
+                        if snapshot.codex_cli_logged_in {
+                            "CLI Logged In"
+                        } else {
+                            "Login Required"
+                        },
+                        if snapshot.codex_cli_logged_in {
+                            cx.theme().success
+                        } else {
+                            cx.theme().warning
+                        },
+                        if snapshot.codex_cli_logged_in {
+                            cx.theme().success_foreground
+                        } else {
+                            cx.theme().warning_foreground
+                        },
+                    ),
+                ]),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .children([
+                    metadata_chip("Model", &settings.model, cx),
+                    metadata_chip("Thread", &settings.thread_id, cx),
+                    metadata_chip("Label", &settings.thread_label, cx),
+                    metadata_chip(
+                        "Session",
+                        snapshot
+                            .codex_cli_session_id
+                            .as_deref()
+                            .unwrap_or("not recorded"),
+                        cx,
+                    ),
+                ]),
+        )
+        .child(
+            document_surface(
+                "engine-identity-summary",
+                format!(
+                    "# Codex CLI Proof\n\n- **CLI status:** {}\n- **CLI account evidence:** {}\n- **Latest completed CLI turn:** {}\n\n> The operator is reading a real Codex CLI session file and a real CLI turn log between turns.",
+                    snapshot.codex_cli_summary,
+                    snapshot
+                        .codex_cli_account_summary
+                        .as_deref()
+                        .unwrap_or("not recorded"),
+                    latest_completed,
+                ),
+                zoom_scale,
+                8.0,
+                Some(12.0),
+                DocumentSurfaceMode::Scroll,
+                window,
+                cx,
+            ),
+        )
+        .child(
+            document_surface(
+                "engine-identity-artifacts",
+                format!("# Artifact Paths\n\n{artifact_paths}"),
+                zoom_scale,
+                8.0,
+                Some(12.0),
+                DocumentSurfaceMode::Scroll,
+                window,
+                cx,
+            ),
+        )
+        .child(
+            document_surface(
+                "engine-identity-events",
+                format!("# Latest CLI Event Evidence\n\n{}", recent_events),
+                zoom_scale,
+                8.0,
+                Some(12.0),
+                DocumentSurfaceMode::Scroll,
+                window,
+                cx,
+            ),
+        )
+        .into_any_element()
 }
 
 fn build_engine_identity_markdown(
