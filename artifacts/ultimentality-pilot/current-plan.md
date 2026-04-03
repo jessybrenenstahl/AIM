@@ -32,12 +32,16 @@ Completed in this slice:
    - conversation now renders in chronological order instead of newest-first inversion
    - sidebar/header language now describe a CLI workbench instead of a generic control surface
    - top-level session chips now expose the live CLI session more directly
+9. Merged the Operate page into a more continuous session workspace:
+   - composer, run controls, and session settings now live in the same main workbench card
+   - transcript sits directly beneath that workbench instead of feeling like a separate dashboard pane
+   - recovery stays visible, but no longer competes with the session settings for primary attention
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
-   - make the transcript/composer relationship feel closer to a true agent client
-   - keep reducing stacked dashboard-card behavior
+   - keep reducing the remaining stacked dashboard-card behavior
+   - make the session lane feel more like a cohesive chat/work surface instead of a tall form plus transcript
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift

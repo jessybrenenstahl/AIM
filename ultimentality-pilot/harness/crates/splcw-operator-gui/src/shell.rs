@@ -906,32 +906,12 @@ impl OperatorShell {
                                 .flex_1()
                                 .min_w_0()
                                 .child(card(
-                                    "Session Transcript",
+                                    "Session Workspace",
                                     Some(
-                                        "This is the main session lane. Full Codex replies should stay readable here instead of being reduced to status summaries.",
-                                    ),
-                                    document_surface(
-                                        "operate-conversation",
-                                        build_conversation_markdown(
-                                            self.app.engine_mode,
-                                            snapshot,
-                                            &prompt_draft,
-                                        ),
-                                        self.zoom_scale,
-                                        24.0,
-                                        Some(46.0),
-                                        DocumentSurfaceMode::Scroll,
-                                        window,
-                                        cx,
-                                    ),
-                                ))
-                                .child(card(
-                                    "Prompt Composer",
-                                    Some(
-                                        "Set the next bounded instruction here, choose the active engine lane, and launch the next turn without leaving the workbench.",
+                                        "Compose the next bounded instruction, keep the session settings close at hand, and read the live Codex conversation in one continuous workspace.",
                                     ),
                                     v_flex()
-                                        .gap_3()
+                                        .gap_4()
                                         .child(
                                             h_flex()
                                                 .gap_2()
@@ -989,6 +969,27 @@ impl OperatorShell {
                                                 ]),
                                         )
                                         .child(Input::new(&self.objective_input).h(px(220.0)))
+                                        .child(
+                                            h_flex()
+                                                .gap_3()
+                                                .items_start()
+                                                .flex_wrap()
+                                                .children([
+                                                    labeled_input("Model", Input::new(&self.model_input)),
+                                                    labeled_input(
+                                                        "Thread Id",
+                                                        Input::new(&self.thread_id_input),
+                                                    ),
+                                                    labeled_input(
+                                                        "Thread Label",
+                                                        Input::new(&self.thread_label_input),
+                                                    ),
+                                                    labeled_input(
+                                                        "Loop Pause (s)",
+                                                        Input::new(&self.loop_pause_input),
+                                                    ),
+                                                ]),
+                                        )
                                         .child(
                                             h_flex()
                                                 .gap_2()
@@ -1056,6 +1057,29 @@ impl OperatorShell {
                                                         }))
                                                         .into_any_element(),
                                                 ]),
+                                        )
+                                        .child(provider_recovery_surface)
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .h(px(1.0))
+                                                .bg(shell_border()),
+                                        )
+                                        .child(
+                                            document_surface(
+                                                "operate-conversation",
+                                                build_conversation_markdown(
+                                                    self.app.engine_mode,
+                                                    snapshot,
+                                                    &prompt_draft,
+                                                ),
+                                                self.zoom_scale,
+                                                28.0,
+                                                Some(52.0),
+                                                DocumentSurfaceMode::Scroll,
+                                                window,
+                                                cx,
+                                            ),
                                         ),
                                 )),
                         )
@@ -1142,25 +1166,10 @@ impl OperatorShell {
                     ),
                 ))
                 .child(card(
-                    "Session Settings",
-                    Some("These controls stay available, but they should read like workspace setup rather than a dashboard form."),
-                    h_flex()
-                        .gap_3()
-                        .items_start()
-                        .flex_wrap()
-                        .children([
-                            labeled_input("Model", Input::new(&self.model_input)),
-                            labeled_input("Thread Id", Input::new(&self.thread_id_input)),
-                            labeled_input("Thread Label", Input::new(&self.thread_label_input)),
-                            labeled_input("Loop Pause (s)", Input::new(&self.loop_pause_input)),
-                        ]),
-                ))
-                .child(card(
                     "Control Follow-through",
                     Some("Recovery, handoff, and retry actions belong in the workbench, not buried in status text."),
                     v_flex()
                         .gap_3()
-                        .child(provider_recovery_surface)
                         .child(
                             h_flex()
                                 .gap_2()
