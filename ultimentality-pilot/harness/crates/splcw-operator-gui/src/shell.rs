@@ -1201,12 +1201,12 @@ impl OperatorShell {
                 ))
                 .into_any_element(),
             OperatorEngineMode::NativeHarness => empty_state(
-                if snapshot.auth_ready {
+                if snapshot.native_auth_ready {
                     "Auth is already complete"
                 } else {
                     "No OAuth flow is waiting"
                 },
-                if snapshot.auth_ready {
+                if snapshot.native_auth_ready {
                     "You do not need to paste a callback code right now. If the Operate page still mentions a provider wait, use Auth Preflight or retry the turn there; it is not waiting on OAuth."
                 } else {
                     "Start a browser or device OAuth flow first. The callback/code field only appears when there is a live authorization to complete."
@@ -2399,7 +2399,7 @@ fn build_engine_identity_markdown(
                     .background_runner_status
                     .as_deref()
                     .unwrap_or("none"),
-                snapshot.auth_summary,
+                snapshot.native_auth_summary,
                 last_completed_round,
             )
         }
@@ -2452,7 +2452,7 @@ fn build_harnessed_model_markdown(
             lines.push(format!("- **Provider:** {}", provider.as_label()));
             lines.push(format!(
                 "- **Auth state:** {}",
-                if snapshot.auth_ready {
+                if snapshot.native_auth_ready {
                     "ready"
                 } else {
                     "blocked"
@@ -2525,7 +2525,10 @@ fn build_operate_status_markdown(
             }
         }
         OperatorEngineMode::NativeHarness => {
-            lines.push(format!("- **Auth readiness:** {}", snapshot.auth_readiness));
+            lines.push(format!(
+                "- **Auth readiness:** {}",
+                snapshot.native_auth_readiness
+            ));
             if provider_retry_needed(snapshot) {
                 lines.push(
                     "- **Provider state:** The last bounded attempt failed after auth. This is not waiting on OAuth or a callback code.".to_string(),
@@ -2543,7 +2546,7 @@ fn build_operate_status_markdown(
                     effective_pending_phase_label(snapshot)
                 ));
                 if phase == "AwaitingProvider"
-                    && snapshot.auth_ready
+                    && snapshot.native_auth_ready
                     && !provider_retry_needed(snapshot)
                 {
                     lines.push(
@@ -2577,7 +2580,7 @@ fn build_operate_status_markdown(
 fn provider_retry_needed(snapshot: &OperatorSnapshot) -> bool {
     snapshot.run_state == "idle"
         && snapshot.pending_turn_phase.as_deref() == Some("AwaitingProvider")
-        && snapshot.auth_ready
+        && snapshot.native_auth_ready
         && snapshot
             .summary
             .contains("Runtime model call failed before the next bounded step")
@@ -2669,12 +2672,12 @@ fn build_auth_status_markdown(
         OperatorEngineMode::NativeHarness => {
             let mut lines = vec![
                 format!("- **Provider:** {}", provider.as_label()),
-                format!("- **Readiness:** {}", snapshot.auth_readiness),
-                format!("- **Summary:** {}", snapshot.auth_summary),
+                format!("- **Readiness:** {}", snapshot.native_auth_readiness),
+                format!("- **Summary:** {}", snapshot.native_auth_summary),
                 format!("- **Interactive OAuth:** {}", oauth_status.summary),
                 format!("- **Operator env:** {}", env_status.summary),
             ];
-            if snapshot.pending_oauth.is_empty() && snapshot.auth_ready {
+            if snapshot.pending_oauth.is_empty() && snapshot.native_auth_ready {
                 lines.push("- **Callback state:** No callback input is needed right now because auth is already complete.".to_string());
             } else if snapshot.pending_oauth.is_empty() {
                 lines.push("- **Callback state:** No OAuth authorization is pending yet. Start a browser or device flow before trying to complete one.".to_string());

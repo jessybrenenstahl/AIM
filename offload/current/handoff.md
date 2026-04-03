@@ -19,13 +19,15 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - `ultimentality-pilot/harness/Launch AGRO Harness Operator.cmd`
 - Verified in AIM:
   - `cargo check -p splcw-operator-gui`
-  - `cargo test -p splcw-operator-gui` (`106` passing)
+  - `cargo test -p splcw-operator-gui` (`108` passing)
   - packaged smoke test from `artifacts/ultimentality-pilot/operator/dist/AGRO Harness Operator.exe`
+- top-level operator readiness now correctly treats a logged-in Codex CLI as ready even when no legacy fallback auth profile exists
+- native/provider fallback readiness is now surfaced separately so the shell stops conflating primary CLI readiness with fallback profile state
 
 ## Immediate Next Action
 
 Make the CLI-first operator path genuinely humane:
 
-1. remove the remaining auth/profile mismatch that makes Codex CLI look unavailable when it is actually logged in
-2. reshape the shell toward transcript/composer/proof workbench behavior
-3. audit the CLI context injection so it always consumes AIM's canonical operating memory instead of falling back to generic replies
+1. reshape the shell toward transcript/composer/proof workbench behavior
+2. audit the CLI context injection so it always consumes AIM's canonical operating memory instead of falling back to generic replies
+3. keep tightening the CLI proof surfaces so the GUI makes the live Codex session undeniable

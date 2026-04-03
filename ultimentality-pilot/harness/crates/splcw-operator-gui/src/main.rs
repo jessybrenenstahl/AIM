@@ -553,6 +553,9 @@ struct OperatorSnapshot {
     auth_ready: bool,
     auth_readiness: String,
     auth_summary: String,
+    native_auth_ready: bool,
+    native_auth_readiness: String,
+    native_auth_summary: String,
     auth_notice: Option<String>,
     codex_cli_available: bool,
     codex_cli_logged_in: bool,
@@ -1469,8 +1472,14 @@ impl HarnessController {
         let auth_store = self.build_auth_store();
         let default_profile = auth_store.load_default_profile().await?;
         let pending_oauth = auth_store.list_pending_oauth().await?;
-        let (auth_ready, auth_readiness, auth_summary) =
+        let (native_auth_ready, native_auth_readiness, native_auth_summary) =
             describe_auth_state(default_profile.as_ref(), &pending_oauth);
+        let (auth_ready, auth_readiness, auth_summary) = describe_operator_auth_state(
+            &codex_cli_status,
+            native_auth_ready,
+            native_auth_readiness.as_str(),
+            native_auth_summary.as_str(),
+        );
         let operator_env_assignments =
             read_operator_env_assignments(&self.paths.operator_env_path)?;
         let background_recovery_recommendation = background_runner.as_ref().and_then(|state| {
@@ -1515,6 +1524,9 @@ impl HarnessController {
             auth_ready,
             auth_readiness,
             auth_summary,
+            native_auth_ready,
+            native_auth_readiness,
+            native_auth_summary,
             auth_notice,
             codex_cli_available: codex_cli_status.available,
             codex_cli_logged_in: codex_cli_status.logged_in,
@@ -1957,7 +1969,7 @@ impl OperatorApp {
             OperatorEngineMode::CodexCli => {
                 snapshot.codex_cli_available && snapshot.codex_cli_logged_in
             }
-            OperatorEngineMode::NativeHarness => snapshot.auth_ready,
+            OperatorEngineMode::NativeHarness => snapshot.native_auth_ready,
         }
     }
 
@@ -3464,7 +3476,7 @@ impl eframe::App for OperatorApp {
         let handoff_pending = snapshot.background_handoff_pending;
         let handoff_ready = snapshot.background_handoff_ready;
         let handoff_settings_match = handoff_pending && self.handoff_settings_match_form(&snapshot);
-        let can_run = snapshot.auth_ready
+        let can_run = self.selected_engine_ready(&snapshot)
             && !self.running.load(Ordering::SeqCst)
             && !auth_busy
             && !background_active;
@@ -3612,7 +3624,7 @@ impl eframe::App for OperatorApp {
                 ));
                 ui.separator();
                 ui.heading("Auth");
-                let auth_color = if snapshot.auth_ready {
+                let auth_color = if self.selected_engine_ready(&snapshot) {
                     egui::Color32::LIGHT_GREEN
                 } else {
                     egui::Color32::LIGHT_RED
@@ -3630,7 +3642,7 @@ impl eframe::App for OperatorApp {
                 {
                     ui.label(format!("recovery: {background_recovery}"));
                 }
-                if !snapshot.auth_ready {
+                if !self.selected_engine_ready(&snapshot) {
                     ui.label("Turn execution is gated until auth is ready.");
                 }
                 let oauth_launch_status = interactive_oauth_launch_status(self.auth_provider);
@@ -7039,6 +7051,64 @@ fn describe_auth_state(
     }
 }
 
+fn describe_operator_auth_state(
+    codex_cli_status: &CodexCliStatus,
+    native_auth_ready: bool,
+    native_auth_readiness: &str,
+    native_auth_summary: &str,
+) -> (bool, String, String) {
+    match (codex_cli_status.available, codex_cli_status.logged_in, native_auth_ready) {
+        (true, true, true) => (
+            true,
+            "ready via Codex CLI (provider fallback also ready)".into(),
+            format!(
+                "primary=Codex CLI ready ({}) | provider_fallback={}",
+                codex_cli_status.summary, native_auth_summary
+            ),
+        ),
+        (true, true, false) => (
+            true,
+            "ready via Codex CLI".into(),
+            format!(
+                "primary=Codex CLI ready ({}) | provider_fallback={}",
+                codex_cli_status.summary, native_auth_readiness
+            ),
+        ),
+        (true, false, true) => (
+            true,
+            "ready via provider fallback (Codex CLI login required for primary lane)".into(),
+            format!(
+                "primary=Codex CLI login required ({}) | provider_fallback={}",
+                codex_cli_status.summary, native_auth_summary
+            ),
+        ),
+        (false, _, true) => (
+            true,
+            "ready via provider fallback (Codex CLI unavailable)".into(),
+            format!(
+                "primary=Codex CLI unavailable ({}) | provider_fallback={}",
+                codex_cli_status.summary, native_auth_summary
+            ),
+        ),
+        (true, false, false) => (
+            false,
+            "blocked: Codex CLI login required and provider fallback is not ready".into(),
+            format!(
+                "primary=Codex CLI login required ({}) | provider_fallback={}",
+                codex_cli_status.summary, native_auth_readiness
+            ),
+        ),
+        (false, _, false) => (
+            false,
+            "blocked: Codex CLI unavailable and provider fallback is not ready".into(),
+            format!(
+                "primary=Codex CLI unavailable ({}) | provider_fallback={}",
+                codex_cli_status.summary, native_auth_readiness
+            ),
+        ),
+    }
+}
+
 fn format_auth_readiness(readiness: &RuntimeAuthReadiness) -> String {
     match readiness {
         RuntimeAuthReadiness::Ready => "ready".into(),
@@ -7812,7 +7882,7 @@ mod tests {
         OperatorAuthProvider, OperatorBackgroundHandoffRequest, OperatorBackgroundRunnerState,
         OperatorCommand, OperatorEngineMode, OperatorGithubActionLifecycleState,
         OperatorGithubActionRequestRecord, OperatorGithubTargetSuggestion, OperatorPaths,
-        OperatorRunMode, OperatorSnapshot, OperatorTurnTerminal, RunSettings,
+        OperatorRunMode, OperatorSnapshot, OperatorTurnTerminal, RunSettings, CodexCliStatus,
         apply_github_target_override, apply_operator_env_assignments_with,
         background_reattach_recommendation, background_recovery_action_label,
         background_runner_allows_spawn, background_runner_owner_shell_alive,
@@ -7822,6 +7892,7 @@ mod tests {
         build_github_target_suggestions_from, build_pending_oauth_view,
         build_project_artifact_context, build_repo_git_context_from, classify_background_handoff,
         classify_background_runner, combine_optional_notices, describe_auth_state,
+        describe_operator_auth_state,
         discover_codex_command_with, discover_openclaw_command_with, discover_repo_root,
         effective_operator_status, ensure_operator_env_template, extract_http_request_target,
         format_background_runner_age, format_runtime_turn_reply,
@@ -7847,7 +7918,7 @@ mod tests {
         RuntimeTurnRecord, SupervisedGithubActionKind, SupervisedGithubActionRequest,
     };
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -9151,6 +9222,55 @@ mod tests {
         assert_eq!(readiness, "ready");
         assert!(summary.contains("default profile=codex-gui"));
         assert!(summary.contains("pending_oauth=0"));
+    }
+
+    #[test]
+    fn describe_operator_auth_state_prefers_logged_in_codex_cli() {
+        let cli = CodexCliStatus {
+            available: true,
+            logged_in: true,
+            summary: "ready via C:\\Users\\jessy\\AppData\\Roaming\\npm\\codex.cmd | Logged in using ChatGPT".into(),
+            command_path: Some(PathBuf::from(r"C:\Users\jessy\AppData\Roaming\npm\codex.cmd")),
+            account_summary: Some("Logged in using ChatGPT".into()),
+        };
+
+        let (ready, readiness, summary) = describe_operator_auth_state(
+            &cli,
+            false,
+            "blocked: no default auth profile configured",
+            "no default auth profile configured | pending_oauth=0",
+        );
+
+        assert!(ready);
+        assert_eq!(readiness, "ready via Codex CLI");
+        assert!(summary.contains("primary=Codex CLI ready"));
+        assert!(summary.contains("provider_fallback=blocked: no default auth profile configured"));
+    }
+
+    #[test]
+    fn describe_operator_auth_state_uses_fallback_when_cli_needs_login() {
+        let cli = CodexCliStatus {
+            available: true,
+            logged_in: false,
+            summary: "codex login required".into(),
+            command_path: Some(PathBuf::from(r"C:\Users\jessy\AppData\Roaming\npm\codex.cmd")),
+            account_summary: None,
+        };
+
+        let (ready, readiness, summary) = describe_operator_auth_state(
+            &cli,
+            true,
+            "ready",
+            "default profile=codex-gui provider=OpenAiCodex mode=OAuth pending_oauth=0",
+        );
+
+        assert!(ready);
+        assert_eq!(
+            readiness,
+            "ready via provider fallback (Codex CLI login required for primary lane)"
+        );
+        assert!(summary.contains("primary=Codex CLI login required"));
+        assert!(summary.contains("provider_fallback=default profile=codex-gui"));
     }
 
     #[test]

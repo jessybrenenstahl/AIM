@@ -20,14 +20,13 @@ Completed in this slice:
 
 ### Immediate Next Work
 
-1. Make the Codex CLI lane the default usable path in AIM even when no legacy OAuth profile is present in operator state.
-2. Rework the GPUI shell toward a real workbench:
+1. Rework the GPUI shell toward a real workbench:
    - transcript-first layout
    - clearer CLI session proof
    - better compose/reply flow
    - less admin-dashboard framing
-3. Audit memory/tool grounding end-to-end so every CLI turn gets the canonical operating memory without relying on brittle heuristics.
-4. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
+2. Audit memory/tool grounding end-to-end so every CLI turn gets the canonical operating memory without relying on brittle heuristics.
+3. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
 
 ### What Not To Do
 
