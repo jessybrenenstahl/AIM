@@ -38,11 +38,12 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - `offload/current/handoff.md`
   - plus live repo/GitHub context when available
 - the Operate page now surfaces that same grounding bundle in a visible `Prompt Grounding` pane
+- the latest shell pass widened the main work surface and improved document rendering so replies with quotes, numbered steps, and fenced blocks survive the GUI more faithfully
 
 ## Immediate Next Action
 
 Make the CLI-first operator path genuinely humane:
 
-1. reshape the shell toward transcript/composer/proof workbench behavior
+1. keep reshaping the shell toward transcript/composer/proof workbench behavior until it feels like a real agent client instead of a dashboard
 2. reduce or properly contextualize the remaining Codex-local warnings (`state_5.sqlite` migration drift and PowerShell shell snapshot warnings)
 3. keep tightening the CLI proof surfaces so the GUI makes the live Codex session undeniable

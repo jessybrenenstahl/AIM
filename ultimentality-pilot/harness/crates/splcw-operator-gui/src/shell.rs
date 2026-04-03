@@ -137,6 +137,18 @@ fn render_document_line(line: &str) -> AnyElement {
         return div().h(rems(0.75)).into_any_element();
     }
 
+    if trimmed.starts_with("```") {
+        return div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .text_xs()
+            .font_semibold()
+            .text_color(shell_muted_text())
+            .child(trimmed.to_string())
+            .into_any_element();
+    }
+
     if let Some(text) = trimmed.strip_prefix("# ") {
         return div()
             .w_full()
@@ -163,6 +175,20 @@ fn render_document_line(line: &str) -> AnyElement {
             .into_any_element();
     }
 
+    if let Some(text) = trimmed.strip_prefix("> ") {
+        return div()
+            .w_full()
+            .min_w_0()
+            .pl_3()
+            .border_l_2()
+            .border_color(shell_chip_border())
+            .text_sm()
+            .text_color(shell_muted_text())
+            .whitespace_normal()
+            .child(simplify_document_text(text))
+            .into_any_element();
+    }
+
     if let Some(text) = trimmed.strip_prefix("- ") {
         return h_flex()
             .w_full()
@@ -181,6 +207,34 @@ fn render_document_line(line: &str) -> AnyElement {
                     .child(simplify_document_text(text)),
             )
             .into_any_element();
+    }
+
+    if let Some((index, text)) = trimmed.split_once(". ") {
+        if !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()) {
+            return h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w(px(24.0))
+                        .pt_0p5()
+                        .text_color(shell_muted_text())
+                        .child(format!("{index}.")),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_sm()
+                        .text_color(shell_text())
+                        .whitespace_normal()
+                        .child(simplify_document_text(text)),
+                )
+                .into_any_element();
+        }
     }
 
     div()
@@ -804,6 +858,22 @@ impl OperatorShell {
             ),
             _ => div().into_any_element(),
         };
+        let engine_label = match self.app.engine_mode {
+            OperatorEngineMode::CodexCli => "Codex CLI",
+            OperatorEngineMode::NativeHarness => "Provider fallback",
+        };
+        let readiness_label = match self.app.engine_mode {
+            OperatorEngineMode::CodexCli => {
+                if snapshot.codex_cli_available && snapshot.codex_cli_logged_in {
+                    "ready via Codex CLI".to_string()
+                } else if snapshot.codex_cli_available {
+                    "Codex CLI login required".to_string()
+                } else {
+                    "Codex CLI missing".to_string()
+                }
+            }
+            OperatorEngineMode::NativeHarness => snapshot.native_auth_readiness.clone(),
+        };
 
         page_scroll(
             v_flex()
@@ -819,7 +889,7 @@ impl OperatorShell {
                                 .child(card(
                                     "Session Transcript",
                                     Some(
-                                        "The center of this screen should be the actual Codex session, with full replies visible and scrollable.",
+                                        "This is the main session lane. Full Codex replies should stay readable here instead of being reduced to status summaries.",
                                     ),
                                     document_surface(
                                         "operate-conversation",
@@ -830,7 +900,7 @@ impl OperatorShell {
                                         ),
                                         self.zoom_scale,
                                         24.0,
-                                        Some(40.0),
+                                        Some(46.0),
                                         DocumentSurfaceMode::Scroll,
                                         window,
                                         cx,
@@ -839,10 +909,35 @@ impl OperatorShell {
                                 .child(card(
                                     "Prompt Composer",
                                     Some(
-                                        "Write the next bounded instruction here, then send one turn or let the loop continue once the target is grounded.",
+                                        "Set the next bounded instruction here, choose the active engine lane, and launch the next turn without leaving the workbench.",
                                     ),
                                     v_flex()
                                         .gap_3()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .flex_wrap()
+                                                .children([
+                                                    metadata_chip("Engine", engine_label, cx),
+                                                    metadata_chip(
+                                                        "Readiness",
+                                                        &readiness_label,
+                                                        cx,
+                                                    ),
+                                                    metadata_chip(
+                                                        "Run state",
+                                                        snapshot.run_state.as_str(),
+                                                        cx,
+                                                    ),
+                                                    metadata_chip(
+                                                        "Turns",
+                                                        &snapshot
+                                                            .completed_turn_count
+                                                            .to_string(),
+                                                        cx,
+                                                    ),
+                                                ]),
+                                        )
                                         .child(
                                             h_flex()
                                                 .gap_2()
@@ -947,7 +1042,7 @@ impl OperatorShell {
                         )
                         .child(
                             div()
-                                .w(px(360.0))
+                                .w(px(392.0))
                                 .flex_none()
                                 .child(card(
                                     "Codex Connection",
@@ -1020,8 +1115,8 @@ impl OperatorShell {
                         "operate-prompt-grounding",
                         build_prompt_grounding_markdown(self.app.engine_mode, snapshot),
                         self.zoom_scale,
-                        18.0,
-                        Some(32.0),
+                        14.0,
+                        Some(24.0),
                         DocumentSurfaceMode::Scroll,
                         window,
                         cx,
@@ -2040,7 +2135,7 @@ impl Render for OperatorShell {
                                     div()
                                         .w_full()
                                         .min_w_0()
-                                        .max_w(px(1880.0))
+                                        .max_w(px(2200.0))
                                         .px_6()
                                         .py_6()
                                         .child(

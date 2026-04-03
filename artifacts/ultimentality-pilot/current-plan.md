@@ -24,14 +24,17 @@ Completed in this slice:
    - reply proved the model read the operating-memory bundle
    - session state persisted into `artifacts/ultimentality-pilot/operator/codex-cli-session.json`
    - reply/event history persisted into `artifacts/ultimentality-pilot/operator/sessions/operator-main/codex-cli-turn-log.jsonl`
+7. Started the humane-shell correction:
+   - widened the 4K work surface
+   - improved reply rendering for quotes, numbered steps, and fenced blocks
+   - pushed the Operate page further toward a transcript/proof workbench instead of a thin admin dashboard
 
 ### Immediate Next Work
 
-1. Rework the GPUI shell toward a real workbench:
-   - transcript-first layout
-   - clearer CLI session proof
-   - better compose/reply flow
-   - less admin-dashboard framing
+1. Keep reworking the GPUI shell toward a real workbench:
+   - make the transcript/composer relationship feel closer to a true agent client
+   - keep reducing stacked dashboard-card behavior
+   - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift
    - decide whether to repair, isolate, or deliberately ignore those warnings in the operator presentation
