@@ -420,8 +420,14 @@ impl OperatorShell {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
-        if self.app.last_refresh.elapsed() >= REFRESH_INTERVAL {
-            let snapshot = self.snapshot();
+        let snapshot = self.snapshot();
+        let refresh_interval = if snapshot.run_state != "idle" || snapshot.codex_cli_live_stream_active
+        {
+            UI_POLL_INTERVAL
+        } else {
+            REFRESH_INTERVAL
+        };
+        if self.app.last_refresh.elapsed() >= refresh_interval {
             self.app.spawn_refresh(
                 snapshot.run_state,
                 parse_run_mode(snapshot.run_mode.as_str()),
@@ -1432,6 +1438,22 @@ impl OperatorShell {
                                         self.zoom_scale,
                                         10.0,
                                         Some(16.0),
+                                        DocumentSurfaceMode::Scroll,
+                                        window,
+                                        cx,
+                                    ),
+                                ))
+                                .child(card(
+                                    "Active Turn Stream",
+                                    Some(
+                                        "Live Codex CLI updates while the current turn is running.",
+                                    ),
+                                    document_surface(
+                                        "operate-live-stream",
+                                        build_active_turn_stream_markdown(snapshot),
+                                        self.zoom_scale,
+                                        8.0,
+                                        Some(14.0),
                                         DocumentSurfaceMode::Scroll,
                                         window,
                                         cx,
@@ -3234,6 +3256,62 @@ fn build_prompt_grounding_markdown(
     }
 }
 
+fn build_active_turn_stream_markdown(snapshot: &OperatorSnapshot) -> String {
+    if !snapshot.codex_cli_live_stream_active
+        && snapshot.codex_cli_live_stream_text.is_none()
+        && snapshot.codex_cli_live_stream_events.is_empty()
+        && snapshot.codex_cli_live_stream_warnings.is_empty()
+    {
+        return "# Active Turn Stream\n\n- No live Codex CLI stream is active right now."
+            .to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "- **Streaming:** {}",
+        if snapshot.codex_cli_live_stream_active {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(updated_at) = snapshot.codex_cli_live_stream_updated_at {
+        lines.push(format!("- **Updated:** {}", updated_at.to_rfc3339()));
+    }
+    if let Some(objective) = snapshot.codex_cli_live_stream_objective.as_deref() {
+        lines.push(format!("- **Objective:** {objective}"));
+    }
+    let mut sections = vec![format!("# Active Turn Stream\n\n{}", lines.join("\n"))];
+    if let Some(text) = snapshot.codex_cli_live_stream_text.as_deref() {
+        if !text.trim().is_empty() {
+            sections.push(format!("## Active text\n\n{}", text.trim()));
+        }
+    }
+    if !snapshot.codex_cli_live_stream_events.is_empty() {
+        sections.push(format!(
+            "## Live events\n\n{}",
+            snapshot
+                .codex_cli_live_stream_events
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !snapshot.codex_cli_live_stream_warnings.is_empty() {
+        sections.push(format!(
+            "## Live warnings\n\n{}",
+            snapshot
+                .codex_cli_live_stream_warnings
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    sections.join("\n\n")
+}
+
 fn provider_retry_needed(snapshot: &OperatorSnapshot) -> bool {
     snapshot.run_state == "idle"
         && snapshot.pending_turn_phase.as_deref() == Some("AwaitingProvider")
@@ -3664,6 +3742,15 @@ fn build_conversation_entries(
                     }
                 }));
             }
+
+            if snapshot.codex_cli_live_stream_active {
+                entries.push(ConversationEntry {
+                    role: ConversationRole::Assistant,
+                    title: "Codex (live)".to_string(),
+                    body: build_live_stream_body(snapshot),
+                    is_draft: false,
+                });
+            }
         }
         OperatorEngineMode::NativeHarness => {
             let replies = &snapshot.recent_turn_replies;
@@ -3695,6 +3782,41 @@ fn build_conversation_entries(
     }
 
     entries
+}
+
+fn build_live_stream_body(snapshot: &OperatorSnapshot) -> String {
+    let mut sections = Vec::new();
+    if let Some(text) = snapshot.codex_cli_live_stream_text.as_deref() {
+        if !text.trim().is_empty() {
+            sections.push(text.trim().to_string());
+        }
+    }
+    if sections.is_empty() {
+        sections.push("Codex is actively working on the current turn.".to_string());
+    }
+    if !snapshot.codex_cli_live_stream_events.is_empty() {
+        sections.push(format!(
+            "Recent live events:\n{}",
+            snapshot
+                .codex_cli_live_stream_events
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !snapshot.codex_cli_live_stream_warnings.is_empty() {
+        sections.push(format!(
+            "Warnings:\n{}",
+            snapshot
+                .codex_cli_live_stream_warnings
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    sections.join("\n\n")
 }
 
 fn split_conversation_reply(reply: &str) -> (String, String) {

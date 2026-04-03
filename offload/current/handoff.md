@@ -47,11 +47,21 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
 - the newest session-lane pass made assistant reply cards actionable: `Use as Draft` now feeds the composer directly from the transcript
 - the newest session-lane pass expanded card actions further: assistant replies can now `Append`, and user cards can `Reuse Prompt`
 - the newest dialogue pass upgraded the CLI session lane into real prompt/reply history using stored Codex CLI objectives, and historical user prompts can now `Run Again` directly from the lane
+- the newest streaming pass proved that packaged Codex CLI turns now emit a live artifact at:
+  - `artifacts/ultimentality-pilot/operator/codex-cli-live-stream.json`
+- that live stream now carries:
+  - active objective
+  - updated timestamp
+  - live warning/event lines during execution
+  - final `agent_message` text once the CLI emits it
+- `status.json` now mirrors those live-stream fields so the GPUI shell can surface them directly on the Operate page
+- important current boundary: the present Codex CLI `exec --json` lane does not appear to emit token-by-token text deltas, so the active stream is truthful but still coarser than Codex App / OpenCode style live text streaming
 
 ## Immediate Next Action
 
 Make the CLI-first operator path genuinely humane:
 
 1. keep reshaping the shell toward transcript/composer/proof workbench behavior until it feels like a real agent client instead of a dashboard
-2. reduce or properly contextualize the remaining Codex-local warnings (`state_5.sqlite` migration drift and PowerShell shell snapshot warnings)
-3. keep tightening the CLI proof surfaces so the GUI makes the live Codex session undeniable
+2. make the new active-turn stream feel first-class in the session workspace instead of diagnostic
+3. reduce or properly contextualize the remaining Codex-local warnings (`state_5.sqlite` migration drift and PowerShell shell snapshot warnings)
+4. decide whether true continuously updating reply text requires a resident interactive CLI/PTTY lane beyond `exec --json`

@@ -60,17 +60,30 @@ Completed in this slice:
    - Codex CLI conversation now renders stored historical objectives paired with their replies
    - the lane reads oldest-to-newest, with the current draft at the tail instead of at the top
    - historical user prompts can now `Run Again`, while the live draft can `Send Draft` directly from the lane
+16. Added real active-turn stream state for packaged Codex CLI runs:
+   - `artifacts/ultimentality-pilot/operator/codex-cli-live-stream.json` now appears during a live `--run-turn`
+   - `status.json` now carries the current objective, updated timestamp, live text, live events, and live warnings from that stream
+   - the Operate page now has an `Active Turn Stream` surface backed by the same live artifact
+   - this was verified against the packaged `AGRO Harness Operator.exe`, not just the debug binary or unit tests
+17. Captured the current streaming boundary explicitly:
+   - the current Codex CLI `exec --json` path gives live warnings and coarse lifecycle events immediately
+   - it also preserves the final `agent_message` into the live stream state
+   - it does not currently appear to emit token-by-token text deltas on this path
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
    - keep reducing the remaining stacked dashboard-card behavior
    - make the session lane more live and interactive beyond historical prompt/reply controls
+   - make the new active-turn stream obvious and useful instead of a secondary debug pane
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift
    - decide whether to repair, isolate, or deliberately ignore those warnings in the operator presentation
-3. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
+3. Decide the next streaming architecture step deliberately:
+   - keep the current `exec --json` lane as the coarse live event stream
+   - or add a resident interactive CLI/PTTY lane if we want true continuously updating reply text
+4. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
 
 ### What Not To Do
 

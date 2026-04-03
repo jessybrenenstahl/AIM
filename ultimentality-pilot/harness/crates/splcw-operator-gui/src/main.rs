@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +48,7 @@ const DEFAULT_LOOP_PAUSE_SECONDS: f32 = 2.0;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const RECENT_TURN_LIMIT: usize = 5;
 const RECENT_EVENT_LIMIT: usize = 8;
+const RECENT_LIVE_STREAM_LINE_LIMIT: usize = 12;
 const RECENT_GITHUB_ACTION_LIMIT: usize = 5;
 const BACKGROUND_RUNNER_STALE_AFTER: Duration = Duration::from_secs(120);
 const BACKGROUND_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
@@ -78,6 +79,7 @@ struct OperatorPaths {
     background_stop_path: PathBuf,
     background_handoff_path: PathBuf,
     codex_cli_session_path: PathBuf,
+    codex_cli_live_stream_path: PathBuf,
     session_root: PathBuf,
     session_id: String,
     state_db_path: PathBuf,
@@ -111,6 +113,7 @@ impl OperatorPaths {
             background_stop_path: operator_root.join("background-stop.request"),
             background_handoff_path: operator_root.join("background-handoff.json"),
             codex_cli_session_path: operator_root.join("codex-cli-session.json"),
+            codex_cli_live_stream_path: operator_root.join("codex-cli-live-stream.json"),
             operator_root,
         })
     }
@@ -480,6 +483,24 @@ struct CodexCliTurnRecord {
     warning_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexCliLiveStreamState {
+    started_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    active: bool,
+    objective: String,
+    session_id: Option<String>,
+    latest_text: String,
+    event_lines: Vec<String>,
+    warning_lines: Vec<String>,
+}
+
+struct CapturedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 struct BackgroundRunnerRead {
     state: Option<OperatorBackgroundRunnerState>,
     disposition: Option<BackgroundRunnerDisposition>,
@@ -566,6 +587,12 @@ struct OperatorSnapshot {
     codex_cli_session_id: Option<String>,
     codex_cli_last_turn_summary: Option<String>,
     codex_cli_last_turn_reply: Option<String>,
+    codex_cli_live_stream_active: bool,
+    codex_cli_live_stream_objective: Option<String>,
+    codex_cli_live_stream_updated_at: Option<DateTime<Utc>>,
+    codex_cli_live_stream_text: Option<String>,
+    codex_cli_live_stream_events: Vec<String>,
+    codex_cli_live_stream_warnings: Vec<String>,
     #[serde(default)]
     codex_cli_recent_turn_objectives: Vec<String>,
     codex_cli_recent_turn_replies: Vec<String>,
@@ -1290,11 +1317,13 @@ impl HarnessController {
                 "-".to_string(),
             ]
         };
-        let output = run_command_capture_with_stdin(
+        let output = run_command_stream_with_stdin(
             command_path,
             &self.paths.repo_root,
             &args,
             prompt.as_bytes(),
+            &self.paths.codex_cli_live_stream_path,
+            settings.objective.as_str(),
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1399,6 +1428,8 @@ impl HarnessController {
         let codex_cli_session =
             read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
         let codex_cli_status = codex_cli_status(&self.paths);
+        let codex_cli_live_stream =
+            read_json_file::<CodexCliLiveStreamState>(self.paths.codex_cli_live_stream_path.clone())?;
         let codex_cli_recent_turn_objectives = recent_codex_cli_turn_records
             .iter()
             .map(|record| record.objective.clone())
@@ -1556,6 +1587,28 @@ impl HarnessController {
                 .map(|state| state.session_id.clone()),
             codex_cli_last_turn_summary,
             codex_cli_last_turn_reply,
+            codex_cli_live_stream_active: codex_cli_live_stream
+                .as_ref()
+                .map(|stream| stream.active)
+                .unwrap_or(false),
+            codex_cli_live_stream_objective: codex_cli_live_stream
+                .as_ref()
+                .map(|stream| stream.objective.clone()),
+            codex_cli_live_stream_updated_at: codex_cli_live_stream
+                .as_ref()
+                .map(|stream| stream.updated_at),
+            codex_cli_live_stream_text: codex_cli_live_stream.as_ref().and_then(|stream| {
+                let text = stream.latest_text.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            }),
+            codex_cli_live_stream_events: codex_cli_live_stream
+                .as_ref()
+                .map(|stream| stream.event_lines.clone())
+                .unwrap_or_default(),
+            codex_cli_live_stream_warnings: codex_cli_live_stream
+                .as_ref()
+                .map(|stream| stream.warning_lines.clone())
+                .unwrap_or_default(),
             codex_cli_recent_turn_objectives,
             codex_cli_recent_turn_replies,
             codex_cli_recent_events,
@@ -5440,12 +5493,14 @@ fn run_command_checked(command_path: &Path, cwd: &Path, args: &[String]) -> anyh
     ))
 }
 
-fn run_command_capture_with_stdin(
+fn run_command_stream_with_stdin(
     command_path: &Path,
     cwd: &Path,
     args: &[String],
     stdin_bytes: &[u8],
-) -> anyhow::Result<std::process::Output> {
+    live_stream_path: &Path,
+    objective: &str,
+) -> anyhow::Result<CapturedCommandOutput> {
     let mut child = build_output_command(command_path, cwd, args)
         .stdin(Stdio::piped())
         .spawn()
@@ -5464,13 +5519,95 @@ fn run_command_capture_with_stdin(
             .with_context(|| format!("write stdin for {}", command_path.display()))?;
     }
 
-    child.wait_with_output().with_context(|| {
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture Codex CLI stdout stream")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture Codex CLI stderr stream")?;
+
+    let now = Utc::now();
+    let live_state = Arc::new(Mutex::new(CodexCliLiveStreamState {
+        started_at: now,
+        updated_at: now,
+        active: true,
+        objective: normalize_text(objective, DEFAULT_OBJECTIVE),
+        session_id: None,
+        latest_text: String::new(),
+        event_lines: Vec::new(),
+        warning_lines: Vec::new(),
+    }));
+    write_json_atomic(
+        live_stream_path,
+        &live_state.lock().expect("live stream poisoned").clone(),
+    )?;
+
+    let stdout_state = Arc::clone(&live_state);
+    let stdout_path = live_stream_path.to_path_buf();
+    let stdout_handle = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let mut reader = BufReader::new(stdout);
+        let mut buffer = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(line.as_bytes());
+            update_codex_cli_live_stream_from_stdout_line(&stdout_state, &stdout_path, &line);
+        }
+        Ok(buffer)
+    });
+
+    let stderr_state = Arc::clone(&live_state);
+    let stderr_path = live_stream_path.to_path_buf();
+    let stderr_handle = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let mut reader = BufReader::new(stderr);
+        let mut buffer = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(line.as_bytes());
+            update_codex_cli_live_stream_from_stderr_line(&stderr_state, &stderr_path, &line);
+        }
+        Ok(buffer)
+    });
+
+    let status = child.wait().with_context(|| {
         format!(
             "wait for {} {} in {}",
             command_path.display(),
             args.join(" "),
             cwd.display()
         )
+    })?;
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| anyhow!("join stdout reader thread"))??;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| anyhow!("join stderr reader thread"))??;
+
+    let final_state = {
+        let mut stream = live_state.lock().expect("live stream poisoned");
+        stream.active = false;
+        stream.updated_at = Utc::now();
+        stream.clone()
+    };
+    write_json_atomic(live_stream_path, &final_state)?;
+
+    Ok(CapturedCommandOutput {
+        status,
+        stdout,
+        stderr,
     })
 }
 
@@ -5624,6 +5761,55 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn append_limited(lines: &mut Vec<String>, line: String, limit: usize) {
+    lines.push(line);
+    if lines.len() > limit {
+        let overflow = lines.len() - limit;
+        lines.drain(0..overflow);
+    }
+}
+
+enum CodexCliTextUpdate {
+    Replace(String),
+    Append(String),
+}
+
+fn codex_cli_text_update_from_event(event: &serde_json::Value) -> Option<CodexCliTextUpdate> {
+    let kind = event.get("type")?.as_str()?;
+    if kind == "item.completed" {
+        let item = event.get("item")?;
+        if item.get("type").and_then(|value| value.as_str()) == Some("agent_message") {
+            if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                return Some(CodexCliTextUpdate::Replace(text.to_string()));
+            }
+        }
+    }
+
+    if kind.contains("delta") {
+        let delta = event
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .or_else(|| event.get("text").and_then(|value| value.as_str()))
+            .or_else(|| {
+                event.get("item")
+                    .and_then(|item| item.get("delta"))
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| {
+                event.get("item")
+                    .and_then(|item| item.get("text"))
+                    .and_then(|value| value.as_str())
+            });
+        if let Some(delta) = delta {
+            if !delta.trim().is_empty() {
+                return Some(CodexCliTextUpdate::Append(delta.to_string()));
+            }
+        }
+    }
+
+    None
+}
+
 fn format_codex_cli_event_line(event: &serde_json::Value) -> Option<String> {
     let kind = event.get("type")?.as_str()?;
     match kind {
@@ -5708,6 +5894,77 @@ fn parse_codex_cli_exec_output(stdout: &str, stderr: &str) -> ParsedCodexCliExec
         event_lines,
         warning_lines,
     }
+}
+
+fn update_codex_cli_live_stream_from_stdout_line(
+    state: &Arc<Mutex<CodexCliLiveStreamState>>,
+    live_stream_path: &Path,
+    line: &str,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let snapshot = {
+        let mut stream = state.lock().expect("live stream poisoned");
+        stream.updated_at = Utc::now();
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(event) => {
+                if stream.session_id.is_none() {
+                    if event.get("type").and_then(|value| value.as_str()) == Some("thread.started")
+                    {
+                        stream.session_id = event
+                            .get("thread_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string);
+                    }
+                }
+                if let Some(formatted) = format_codex_cli_event_line(&event) {
+                    append_limited(
+                        &mut stream.event_lines,
+                        formatted,
+                        RECENT_LIVE_STREAM_LINE_LIMIT,
+                    );
+                }
+                if let Some(update) = codex_cli_text_update_from_event(&event) {
+                    match update {
+                        CodexCliTextUpdate::Replace(text) => stream.latest_text = text,
+                        CodexCliTextUpdate::Append(delta) => stream.latest_text.push_str(&delta),
+                    }
+                }
+            }
+            Err(_) => append_limited(
+                &mut stream.event_lines,
+                format!("stdout {}", truncate_for_summary(trimmed, 160)),
+                RECENT_LIVE_STREAM_LINE_LIMIT,
+            ),
+        }
+        stream.clone()
+    };
+    let _ = write_json_atomic(live_stream_path, &snapshot);
+}
+
+fn update_codex_cli_live_stream_from_stderr_line(
+    state: &Arc<Mutex<CodexCliLiveStreamState>>,
+    live_stream_path: &Path,
+    line: &str,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let snapshot = {
+        let mut stream = state.lock().expect("live stream poisoned");
+        stream.updated_at = Utc::now();
+        append_limited(
+            &mut stream.warning_lines,
+            trimmed.to_string(),
+            RECENT_LIVE_STREAM_LINE_LIMIT,
+        );
+        stream.clone()
+    };
+    let _ = write_json_atomic(live_stream_path, &snapshot);
 }
 
 fn format_codex_cli_turn_reply(turn: &CodexCliTurnRecord) -> String {
@@ -8236,6 +8493,7 @@ mod tests {
             background_stop_path: operator_root.join("background-stop.request"),
             background_handoff_path: operator_root.join("background-handoff.json"),
             codex_cli_session_path: operator_root.join("codex-cli-session.json"),
+            codex_cli_live_stream_path: operator_root.join("codex-cli-live-stream.json"),
             session_root: operator_root.join("sessions"),
             session_id: DEFAULT_SESSION_ID.into(),
             state_db_path: operator_root.join("state.sqlite"),
@@ -10253,6 +10511,11 @@ mod tests {
                 .join("ultimentality-pilot")
                 .join("operator")
                 .join("codex-cli-session.json"),
+            codex_cli_live_stream_path: repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("operator")
+                .join("codex-cli-live-stream.json"),
             session_root: repo_root
                 .join("artifacts")
                 .join("ultimentality-pilot")
