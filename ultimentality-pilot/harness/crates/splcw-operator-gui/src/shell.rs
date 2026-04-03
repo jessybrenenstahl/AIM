@@ -570,6 +570,26 @@ impl OperatorShell {
         cx.notify();
     }
 
+    fn append_objective_draft(
+        &mut self,
+        addition: impl AsRef<str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.objective_input.read(cx).value().to_string();
+        let addition = addition.as_ref().trim();
+        let next = if existing.trim().is_empty() {
+            addition.to_string()
+        } else if addition.is_empty() {
+            existing
+        } else {
+            format!("{existing}\n\n{addition}")
+        };
+        set_input_value(&self.objective_input, next, window, cx);
+        self.sync_form_into_state(cx);
+        cx.notify();
+    }
+
     fn select_auth_provider(&mut self, provider: OperatorAuthProvider, cx: &mut Context<Self>) {
         self.app.auth_provider = provider;
         cx.notify();
@@ -676,6 +696,7 @@ impl OperatorShell {
         };
         let copy_body = entry.body.clone();
         let draft_body = entry.body.clone();
+        let append_body = entry.body.clone();
         let actions = {
             let copy_button = Button::new(SharedString::from(format!("{id}-copy")))
                 .label("Copy")
@@ -690,6 +711,15 @@ impl OperatorShell {
                 ConversationRole::Assistant => h_flex()
                     .gap_2()
                     .children([
+                        Button::new(SharedString::from(format!("{id}-append")))
+                            .label("Append")
+                            .ghost()
+                            .compact()
+                            .disabled(append_body.trim().is_empty())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.append_objective_draft(&append_body, window, cx);
+                            }))
+                            .into_any_element(),
                         Button::new(SharedString::from(format!("{id}-draft")))
                             .label("Use as Draft")
                             .ghost()
@@ -702,7 +732,21 @@ impl OperatorShell {
                         copy_button,
                     ])
                     .into_any_element(),
-                ConversationRole::User => copy_button,
+                ConversationRole::User => h_flex()
+                    .gap_2()
+                    .children([
+                        Button::new(SharedString::from(format!("{id}-reuse")))
+                            .label("Reuse Prompt")
+                            .ghost()
+                            .compact()
+                            .disabled(draft_body.trim().is_empty())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_objective_draft(draft_body.clone(), window, cx);
+                            }))
+                            .into_any_element(),
+                        copy_button,
+                    ])
+                    .into_any_element(),
             }
         };
 
