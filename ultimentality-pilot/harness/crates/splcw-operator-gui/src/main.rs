@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use splcw_core::{Invariant, PlanModule, PlanSnapshot, SufficientPlan};
 use splcw_host::EmbeddedHostBody;
 use splcw_llm::{
-    AuthProfile, AuthProfileStore, ConfiguredLlmClient, FileAuthProfileStore,
-    OAuthAuthorizationKind, OAuthInitiationMode, PendingOAuthAuthorization, ProviderKind,
-    ProviderRegistry, RuntimeAuthReadiness, builtin_interactive_oauth_client_id,
+    AuthProfile, AuthProfileStore, ChatResponse, ConfiguredLlmClient, ContentBlock,
+    FileAuthProfileStore, OAuthAuthorizationKind, OAuthInitiationMode, PendingOAuthAuthorization,
+    ProviderKind, ProviderRegistry, RuntimeAuthReadiness, builtin_interactive_oauth_client_id,
     inspect_runtime_auth, register_openai_responses_providers,
 };
 use splcw_memory::{FilesystemOffloadSink, SqliteStateStore};
@@ -58,6 +58,7 @@ const SUPPORTED_OPERATOR_ENV_NAMES: &[&str] = &[
     "OPENAI_API_OAUTH_CLIENT_ID",
     "SPLCW_OPENAI_OAUTH_CLIENT_ID",
     "OPENAI_OAUTH_CLIENT_ID",
+    "CODEX_BIN",
     "OPENCLAW_BIN",
     "OPENCLAW_STATE_DIR",
     "OPENCLAW_AGENT_DIR",
@@ -76,6 +77,7 @@ struct OperatorPaths {
     background_runner_path: PathBuf,
     background_stop_path: PathBuf,
     background_handoff_path: PathBuf,
+    codex_cli_session_path: PathBuf,
     session_root: PathBuf,
     session_id: String,
     state_db_path: PathBuf,
@@ -88,7 +90,7 @@ impl OperatorPaths {
             std::env::current_dir().ok().as_deref(),
             std::env::current_exe().ok().as_deref(),
         )
-        .context("locate FFR repo root from current directory or executable path")?;
+        .context("locate AIM repo root from current directory or executable path")?;
         let harness_root = repo_root.join("ultimentality-pilot").join("harness");
         let operator_root = repo_root
             .join("artifacts")
@@ -108,6 +110,7 @@ impl OperatorPaths {
             background_runner_path: operator_root.join("background-runner.json"),
             background_stop_path: operator_root.join("background-stop.request"),
             background_handoff_path: operator_root.join("background-handoff.json"),
+            codex_cli_session_path: operator_root.join("codex-cli-session.json"),
             operator_root,
         })
     }
@@ -135,6 +138,8 @@ struct RunSettings {
     model: String,
     thread_id: String,
     thread_label: String,
+    #[serde(default = "default_native_engine_mode")]
+    engine_mode: OperatorEngineMode,
 }
 
 impl Default for RunSettings {
@@ -144,8 +149,29 @@ impl Default for RunSettings {
             model: DEFAULT_MODEL.into(),
             thread_id: DEFAULT_THREAD_ID.into(),
             thread_label: DEFAULT_THREAD_LABEL.into(),
+            engine_mode: OperatorEngineMode::CodexCli,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperatorEngineMode {
+    CodexCli,
+    NativeHarness,
+}
+
+impl OperatorEngineMode {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::CodexCli => "Codex CLI",
+            Self::NativeHarness => "Native Harness",
+        }
+    }
+}
+
+fn default_native_engine_mode() -> OperatorEngineMode {
+    OperatorEngineMode::NativeHarness
 }
 
 #[derive(Debug, Clone, Default)]
@@ -324,6 +350,15 @@ struct OpenClawCliStatus {
     command_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexCliStatus {
+    available: bool,
+    logged_in: bool,
+    summary: String,
+    command_path: Option<PathBuf>,
+    account_summary: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct OpenClawImportPlan {
     source_path: PathBuf,
@@ -418,9 +453,30 @@ struct OperatorBackgroundRunnerState {
     model: String,
     thread_id: String,
     thread_label: String,
+    #[serde(default = "default_native_engine_mode")]
+    engine_mode: OperatorEngineMode,
     completed_turn_count: u64,
     last_summary: Option<String>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexCliSessionState {
+    session_id: String,
+    updated_at: DateTime<Utc>,
+    model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexCliTurnRecord {
+    recorded_at: DateTime<Utc>,
+    session_id: Option<String>,
+    model: String,
+    objective: String,
+    reply: String,
+    summary: String,
+    event_lines: Vec<String>,
+    warning_lines: Vec<String>,
 }
 
 struct BackgroundRunnerRead {
@@ -498,6 +554,16 @@ struct OperatorSnapshot {
     auth_readiness: String,
     auth_summary: String,
     auth_notice: Option<String>,
+    codex_cli_available: bool,
+    codex_cli_logged_in: bool,
+    codex_cli_summary: String,
+    codex_cli_command_path: Option<String>,
+    codex_cli_account_summary: Option<String>,
+    codex_cli_session_id: Option<String>,
+    codex_cli_last_turn_summary: Option<String>,
+    codex_cli_last_turn_reply: Option<String>,
+    codex_cli_recent_turn_replies: Vec<String>,
+    codex_cli_recent_events: Vec<String>,
     operator_env_configured_keys: Vec<String>,
     github_action_pending: bool,
     github_action_state: Option<String>,
@@ -532,6 +598,7 @@ struct OperatorSnapshot {
     background_runner_thread_label: Option<String>,
     background_runner_model: Option<String>,
     background_runner_objective: Option<String>,
+    background_runner_engine_mode: Option<String>,
     background_runner_loop_pause_seconds: Option<f32>,
     background_runner_turn_count: Option<u64>,
     background_stop_requested: bool,
@@ -549,6 +616,7 @@ struct OperatorSnapshot {
     background_handoff_model: Option<String>,
     background_handoff_thread_id: Option<String>,
     background_handoff_thread_label: Option<String>,
+    background_handoff_engine_mode: Option<String>,
     background_handoff_loop_pause_seconds: Option<f32>,
     foreground_thread_id: Option<String>,
     compaction_count: Option<u64>,
@@ -556,7 +624,9 @@ struct OperatorSnapshot {
     pending_turn_action: Option<String>,
     completed_turn_count: u64,
     last_turn_summary: Option<String>,
+    last_turn_reply: Option<String>,
     recent_turns: Vec<String>,
+    recent_turn_replies: Vec<String>,
     recent_events: Vec<String>,
     pending_oauth: Vec<OperatorPendingOAuthView>,
     current_brief: Option<String>,
@@ -1052,6 +1122,11 @@ impl HarnessController {
             .arg(settings.thread_id.as_str())
             .arg("--thread-label")
             .arg(settings.thread_label.as_str())
+            .arg("--engine-mode")
+            .arg(match settings.engine_mode {
+                OperatorEngineMode::CodexCli => "codex_cli",
+                OperatorEngineMode::NativeHarness => "native_harness",
+            })
             .arg("--loop-pause-seconds")
             .arg(format!("{:.2}", loop_pause_seconds.max(0.0)))
             .current_dir(&self.paths.repo_root)
@@ -1081,6 +1156,13 @@ impl HarnessController {
     }
 
     async fn run_turn(&self, settings: &RunSettings) -> anyhow::Result<OperatorTurnResult> {
+        match settings.engine_mode {
+            OperatorEngineMode::CodexCli => self.run_codex_cli_turn(settings).await,
+            OperatorEngineMode::NativeHarness => self.run_native_turn(settings).await,
+        }
+    }
+
+    async fn run_native_turn(&self, settings: &RunSettings) -> anyhow::Result<OperatorTurnResult> {
         let store = Arc::new(SqliteStateStore::connect(&self.paths.state_db_path).await?);
         let offload = Arc::new(FilesystemOffloadSink::new(&self.paths.repo_root));
         let orchestrator = PersistentOrchestrator::new(store, offload);
@@ -1153,6 +1235,109 @@ impl HarnessController {
         })
     }
 
+    async fn run_codex_cli_turn(
+        &self,
+        settings: &RunSettings,
+    ) -> anyhow::Result<OperatorTurnResult> {
+        let cli_status = codex_cli_status(&self.paths);
+        if !cli_status.available {
+            anyhow::bail!(cli_status.summary);
+        }
+        if !cli_status.logged_in {
+            anyhow::bail!(
+                "Codex CLI is installed but not logged in yet. Use the Auth page to launch `codex login` first."
+            );
+        }
+        let command_path = cli_status
+            .command_path
+            .as_ref()
+            .context("Codex CLI command path was not recorded")?;
+        let session_dir = self.paths.session_root.join(&self.paths.session_id);
+        fs::create_dir_all(&session_dir)
+            .with_context(|| format!("create session dir {}", session_dir.display()))?;
+        let prompt = build_codex_cli_context_prompt(&self.paths, settings.objective.as_str());
+        let previous_session =
+            read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
+        let mut args = if let Some(previous_session) = previous_session.as_ref() {
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--json".to_string(),
+                "-m".to_string(),
+                normalize_text(&settings.model, DEFAULT_MODEL),
+                previous_session.session_id.clone(),
+            ]
+        } else {
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "-m".to_string(),
+                normalize_text(&settings.model, DEFAULT_MODEL),
+                "-C".to_string(),
+                self.paths.repo_root.display().to_string(),
+            ]
+        };
+        args.push(prompt);
+        let output = run_command_capture(command_path, &self.paths.repo_root, &args)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let parsed = parse_codex_cli_exec_output(&stdout, &stderr);
+        let session_id = parsed.session_id.clone().or_else(|| {
+            previous_session
+                .as_ref()
+                .map(|state| state.session_id.clone())
+        });
+        if let Some(session_id) = session_id.as_ref() {
+            write_json_atomic(
+                &self.paths.codex_cli_session_path,
+                &CodexCliSessionState {
+                    session_id: session_id.clone(),
+                    updated_at: Utc::now(),
+                    model: normalize_text(&settings.model, DEFAULT_MODEL),
+                },
+            )?;
+        }
+        let warning_lines = parsed.warning_lines.clone();
+        let summary = if !warning_lines.is_empty() {
+            format!(
+                "{} | warning: {}",
+                parsed.summary,
+                truncate_for_summary(&warning_lines[0], 120)
+            )
+        } else {
+            parsed.summary.clone()
+        };
+        append_jsonl_entry(
+            &session_dir.join("codex-cli-turn-log.jsonl"),
+            &CodexCliTurnRecord {
+                recorded_at: Utc::now(),
+                session_id,
+                model: normalize_text(&settings.model, DEFAULT_MODEL),
+                objective: normalize_text(&settings.objective, DEFAULT_OBJECTIVE),
+                reply: parsed.reply.clone(),
+                summary: summary.clone(),
+                event_lines: parsed.event_lines,
+                warning_lines,
+            },
+        )?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Codex CLI turn failed: {}",
+                if parsed.reply.trim().is_empty() {
+                    stderr.trim()
+                } else {
+                    parsed.reply.trim()
+                }
+            );
+        }
+        Ok(OperatorTurnResult {
+            terminal: OperatorTurnTerminal::Completed,
+            summary: format!("Codex CLI: {summary}"),
+        })
+    }
+
     async fn read_snapshot(
         &self,
         run_state: &str,
@@ -1171,6 +1356,10 @@ impl HarnessController {
             session_dir.join("turn-log.jsonl"),
             RECENT_TURN_LIMIT,
         )?;
+        let recent_codex_cli_turn_records = read_recent_jsonl_entries::<CodexCliTurnRecord>(
+            session_dir.join("codex-cli-turn-log.jsonl"),
+            RECENT_TURN_LIMIT,
+        )?;
         let recent_event_lines = match session_state.as_ref() {
             Some(state) => read_recent_jsonl_entries::<RuntimeSessionEvent>(
                 session_dir.join(&state.current_transcript_path),
@@ -1186,6 +1375,39 @@ impl HarnessController {
             .map(RuntimeTurnRecord::summarize)
             .collect::<Vec<_>>();
         let last_turn_summary = recent_turn_records.last().map(RuntimeTurnRecord::summarize);
+        let recent_turn_replies = recent_turn_records
+            .iter()
+            .rev()
+            .map(format_runtime_turn_reply)
+            .collect::<Vec<_>>();
+        let last_turn_reply = recent_turn_records.last().map(format_runtime_turn_reply);
+        let codex_cli_session =
+            read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
+        let codex_cli_status = codex_cli_status(&self.paths);
+        let codex_cli_recent_turn_replies = recent_codex_cli_turn_records
+            .iter()
+            .rev()
+            .map(format_codex_cli_turn_reply)
+            .collect::<Vec<_>>();
+        let codex_cli_last_turn_reply = recent_codex_cli_turn_records
+            .last()
+            .map(format_codex_cli_turn_reply);
+        let codex_cli_last_turn_summary = recent_codex_cli_turn_records
+            .last()
+            .map(|record| record.summary.clone());
+        let codex_cli_recent_events = recent_codex_cli_turn_records
+            .last()
+            .map(|record| {
+                let mut events = record.event_lines.clone();
+                events.extend(
+                    record
+                        .warning_lines
+                        .iter()
+                        .map(|line| format!("warning {line}")),
+                );
+                events
+            })
+            .unwrap_or_default();
         let mut github_action_request = self.read_github_action_request()?;
         if let Some(request) = github_action_request.as_mut() {
             let enriched = self.enrich_github_action_request_record(request.clone());
@@ -1294,6 +1516,21 @@ impl HarnessController {
             auth_readiness,
             auth_summary,
             auth_notice,
+            codex_cli_available: codex_cli_status.available,
+            codex_cli_logged_in: codex_cli_status.logged_in,
+            codex_cli_summary: codex_cli_status.summary,
+            codex_cli_command_path: codex_cli_status
+                .command_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            codex_cli_account_summary: codex_cli_status.account_summary,
+            codex_cli_session_id: codex_cli_session
+                .as_ref()
+                .map(|state| state.session_id.clone()),
+            codex_cli_last_turn_summary,
+            codex_cli_last_turn_reply,
+            codex_cli_recent_turn_replies,
+            codex_cli_recent_events,
             operator_env_configured_keys: operator_env_assignments
                 .iter()
                 .map(|(key, _)| key.clone())
@@ -1396,6 +1633,9 @@ impl HarnessController {
             background_runner_objective: background_runner
                 .as_ref()
                 .map(|state| state.objective.clone()),
+            background_runner_engine_mode: background_runner
+                .as_ref()
+                .map(|state| state.engine_mode.as_label().to_string()),
             background_runner_loop_pause_seconds: background_runner
                 .as_ref()
                 .map(|state| state.loop_pause_seconds),
@@ -1436,6 +1676,9 @@ impl HarnessController {
             background_handoff_thread_label: background_handoff
                 .as_ref()
                 .map(|request| request.settings.thread_label.clone()),
+            background_handoff_engine_mode: background_handoff
+                .as_ref()
+                .map(|request| request.settings.engine_mode.as_label().to_string()),
             background_handoff_loop_pause_seconds: background_handoff
                 .as_ref()
                 .map(|request| request.loop_pause_seconds),
@@ -1452,7 +1695,9 @@ impl HarnessController {
                 .map(|action| format!("{action:?}")),
             completed_turn_count,
             last_turn_summary,
+            last_turn_reply,
             recent_turns,
+            recent_turn_replies,
             recent_events: recent_event_lines,
             pending_oauth: pending_oauth.iter().map(build_pending_oauth_view).collect(),
             current_brief: read_text_if_exists(
@@ -1516,6 +1761,53 @@ impl HarnessController {
             format!("{default_label} ({default_source_profile_id})"),
             format_auth_preflight_report(&report)
         ))
+    }
+
+    fn launch_codex_cli_login(&self) -> anyhow::Result<String> {
+        let command_path = discover_codex_command()
+            .context("no Codex CLI found; install Codex or set CODEX_BIN in operator.env")?;
+        let launch_target = command_path.display().to_string();
+        let args = ["login"];
+
+        #[cfg(target_os = "windows")]
+        {
+            const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+            let script = format!(
+                "& '{}' {}",
+                launch_target.replace('\'', "''"),
+                args.join(" ")
+            );
+            let child = Command::new("powershell.exe")
+                .arg("-NoExit")
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(script)
+                .current_dir(&self.paths.repo_root)
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .spawn()
+                .context("launch Codex CLI login terminal")?;
+            return Ok(format!(
+                "launched Codex CLI login in a new terminal (pid={}) via {} | finish sign-in there, then refresh this shell",
+                child.id(),
+                launch_target
+            ));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let child = Command::new(&command_path)
+                .args(args)
+                .current_dir(&self.paths.repo_root)
+                .spawn()
+                .with_context(|| format!("launch {}", command_path.display()))?;
+            Ok(format!(
+                "launched Codex CLI login (pid={}) via {} | finish sign-in, then refresh this shell",
+                child.id(),
+                launch_target
+            ))
+        }
     }
 
     fn launch_openclaw_codex_login(&self) -> anyhow::Result<String> {
@@ -1619,6 +1911,7 @@ struct OperatorApp {
     shell_instance_id: String,
     shell_pid: u32,
     settings: RunSettings,
+    engine_mode: OperatorEngineMode,
     auth_provider: OperatorAuthProvider,
     auth_label: String,
     auth_callback_input: String,
@@ -1639,6 +1932,7 @@ impl OperatorApp {
             shell_instance_id: Uuid::new_v4().to_string(),
             shell_pid: std::process::id(),
             settings: RunSettings::default(),
+            engine_mode: OperatorEngineMode::CodexCli,
             auth_provider: OperatorAuthProvider::OpenAiCodex,
             auth_label: "codex-gui".into(),
             auth_callback_input: String::new(),
@@ -1655,6 +1949,15 @@ impl OperatorApp {
             auth_working: Arc::new(AtomicBool::new(false)),
             loop_pause_seconds: DEFAULT_LOOP_PAUSE_SECONDS,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
+        }
+    }
+
+    fn selected_engine_ready(&self, snapshot: &OperatorSnapshot) -> bool {
+        match self.engine_mode {
+            OperatorEngineMode::CodexCli => {
+                snapshot.codex_cli_available && snapshot.codex_cli_logged_in
+            }
+            OperatorEngineMode::NativeHarness => snapshot.auth_ready,
         }
     }
 
@@ -1917,6 +2220,8 @@ impl OperatorApp {
                 == Some(self.settings.thread_id.as_str())
             && snapshot.background_runner_thread_label.as_deref()
                 == Some(self.settings.thread_label.as_str())
+            && snapshot.background_runner_engine_mode.as_deref()
+                == Some(self.settings.engine_mode.as_label())
             && snapshot
                 .background_runner_loop_pause_seconds
                 .map(|value| (value - self.loop_pause_seconds).abs() < 0.05)
@@ -1935,6 +2240,13 @@ impl OperatorApp {
         }
         if let Some(thread_label) = snapshot.background_runner_thread_label.as_deref() {
             self.settings.thread_label = thread_label.to_string();
+        }
+        if let Some(engine_mode) = snapshot.background_runner_engine_mode.as_deref() {
+            self.settings.engine_mode = match engine_mode {
+                "Codex CLI" => OperatorEngineMode::CodexCli,
+                _ => OperatorEngineMode::NativeHarness,
+            };
+            self.engine_mode = self.settings.engine_mode;
         }
         if let Some(loop_pause_seconds) = snapshot.background_runner_loop_pause_seconds {
             self.loop_pause_seconds = loop_pause_seconds;
@@ -1960,6 +2272,8 @@ impl OperatorApp {
                 == Some(self.settings.thread_id.as_str())
             && snapshot.background_handoff_thread_label.as_deref()
                 == Some(self.settings.thread_label.as_str())
+            && snapshot.background_handoff_engine_mode.as_deref()
+                == Some(self.settings.engine_mode.as_label())
             && snapshot
                 .background_handoff_loop_pause_seconds
                 .map(|value| (value - self.loop_pause_seconds).abs() < 0.05)
@@ -1978,6 +2292,13 @@ impl OperatorApp {
         }
         if let Some(thread_label) = snapshot.background_handoff_thread_label.as_deref() {
             self.settings.thread_label = thread_label.to_string();
+        }
+        if let Some(engine_mode) = snapshot.background_handoff_engine_mode.as_deref() {
+            self.settings.engine_mode = match engine_mode {
+                "Codex CLI" => OperatorEngineMode::CodexCli,
+                _ => OperatorEngineMode::NativeHarness,
+            };
+            self.engine_mode = self.settings.engine_mode;
         }
         if let Some(loop_pause_seconds) = snapshot.background_handoff_loop_pause_seconds {
             self.loop_pause_seconds = loop_pause_seconds;
@@ -2802,6 +3123,50 @@ impl OperatorApp {
             let auth_notice = match result {
                 Ok(summary) => Some(summary),
                 Err(error) => Some(format!("OpenClaw auth import failed: {error:#}")),
+            };
+            let current_for_snapshot = current.clone();
+            let auth_notice_for_snapshot = auth_notice.clone();
+            let controller_for_snapshot = controller.clone();
+            let next = run_async(move || async move {
+                controller_for_snapshot
+                    .read_snapshot(
+                        &current_for_snapshot.run_state,
+                        parse_run_mode(current_for_snapshot.run_mode.as_str()),
+                        &current_for_snapshot.summary,
+                        current_for_snapshot.last_error.clone(),
+                        current_for_snapshot.completed_turn_count,
+                        auth_notice_for_snapshot.clone(),
+                    )
+                    .await
+            })
+            .unwrap_or(OperatorSnapshot {
+                refreshed_at: Some(Utc::now()),
+                run_state: current.run_state,
+                run_mode: current.run_mode,
+                summary: current.summary,
+                last_error: current.last_error,
+                completed_turn_count: current.completed_turn_count,
+                auth_notice,
+                ..OperatorSnapshot::default()
+            });
+            *snapshot.lock().expect("operator snapshot poisoned") = next;
+            auth_working.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn spawn_launch_codex_cli_login(&mut self) {
+        if self.auth_working.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let controller = self.controller.clone();
+        let snapshot = self.snapshot.clone();
+        let auth_working = self.auth_working.clone();
+        std::thread::spawn(move || {
+            let current = snapshot.lock().expect("operator snapshot poisoned").clone();
+            let result = controller.launch_codex_cli_login();
+            let auth_notice = match result {
+                Ok(summary) => Some(summary),
+                Err(error) => Some(format!("Codex CLI login launch failed: {error:#}")),
             };
             let current_for_snapshot = current.clone();
             let auth_notice_for_snapshot = auth_notice.clone();
@@ -4941,6 +5306,257 @@ fn run_repo_command_checked(
     ))
 }
 
+fn build_output_command(command_path: &Path, cwd: &Path, args: &[String]) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let extension = command_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase());
+        if matches!(extension.as_deref(), Some("cmd" | "bat")) {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/d").arg("/c").arg(command_path);
+            command.args(args);
+            command.current_dir(cwd);
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            return command;
+        }
+    }
+
+    let mut command = Command::new(command_path);
+    command.args(args);
+    command.current_dir(cwd);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command
+}
+
+fn run_command_checked(command_path: &Path, cwd: &Path, args: &[String]) -> anyhow::Result<String> {
+    let output = build_output_command(command_path, cwd, args)
+        .output()
+        .with_context(|| {
+            format!(
+                "run {} {} in {}",
+                command_path.display(),
+                args.join(" "),
+                cwd.display()
+            )
+        })?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok(if stdout.is_empty() { stderr } else { stdout });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    Err(anyhow!(
+        "{} {} failed: {}",
+        command_path.display(),
+        args.join(" "),
+        if detail.is_empty() {
+            format!("exit code {:?}", output.status.code())
+        } else {
+            detail
+        }
+    ))
+}
+
+fn run_command_capture(
+    command_path: &Path,
+    cwd: &Path,
+    args: &[String],
+) -> anyhow::Result<std::process::Output> {
+    build_output_command(command_path, cwd, args)
+        .output()
+        .with_context(|| {
+            format!(
+                "run {} {} in {}",
+                command_path.display(),
+                args.join(" "),
+                cwd.display()
+            )
+        })
+}
+
+#[derive(Debug)]
+struct ParsedCodexCliExecOutput {
+    session_id: Option<String>,
+    reply: String,
+    summary: String,
+    event_lines: Vec<String>,
+    warning_lines: Vec<String>,
+}
+
+fn build_codex_cli_context_prompt(paths: &OperatorPaths, objective: &str) -> String {
+    format!(
+        "You are Codex running inside the AGRO / AIM repo at `{}`.\n\
+\n\
+Before acting, rehydrate from these canonical files:\n\
+- `README.md`\n\
+- `ultimentality-pilot/harness/ARCHITECTURE.md`\n\
+- `artifacts/ultimentality-pilot/baseline/clean-splcw-harness-2026-04-03.md`\n\
+- `artifacts/ultimentality-pilot/memory/os.md`\n\
+- `artifacts/ultimentality-pilot/memory/memory.md`\n\
+- `artifacts/ultimentality-pilot/roadmap.md`\n\
+- `artifacts/ultimentality-pilot/current-plan.md`\n\
+- `offload/current/brief.md`\n\
+- `offload/current/plan.md`\n\
+- `offload/current/open-gaps.md`\n\
+- `offload/current/handoff.md`\n\
+\n\
+Treat those files as always-on operating memory for this session instead of improvising from a thin summary.\n\
+\n\
+Use the memory surfaces and continuity artifacts before replying. Prefer grounded use of the existing host, verification, memory, and orchestrator tools over generic repo chatter.\n\
+\n\
+Current objective:\n\
+{}\n",
+        paths.repo_root.display(),
+        normalize_text(objective, DEFAULT_OBJECTIVE)
+    )
+}
+
+fn summarize_codex_cli_reply(reply: &str) -> String {
+    let first_line = reply
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Codex CLI completed without a visible reply.");
+    truncate_for_summary(first_line, 180)
+}
+
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn format_codex_cli_event_line(event: &serde_json::Value) -> Option<String> {
+    let kind = event.get("type")?.as_str()?;
+    match kind {
+        "thread.started" => Some(format!(
+            "thread.started {}",
+            event.get("thread_id")?.as_str().unwrap_or("unknown")
+        )),
+        "turn.started" => Some("turn.started".into()),
+        "turn.completed" => Some("turn.completed".into()),
+        "item.completed" => {
+            let item = event.get("item")?;
+            match item.get("type")?.as_str()? {
+                "agent_message" => Some(format!(
+                    "agent_message {}",
+                    truncate_for_summary(item.get("text")?.as_str().unwrap_or_default(), 120)
+                )),
+                "command_execution" => Some(format!(
+                    "command_execution {}",
+                    truncate_for_summary(item.get("command")?.as_str().unwrap_or_default(), 120)
+                )),
+                other => Some(format!("item.completed {other}")),
+            }
+        }
+        "item.started" => {
+            let item = event.get("item")?;
+            let item_type = item.get("type")?.as_str().unwrap_or("unknown");
+            Some(format!("item.started {item_type}"))
+        }
+        other => Some(other.to_string()),
+    }
+}
+
+fn parse_codex_cli_exec_output(stdout: &str, stderr: &str) -> ParsedCodexCliExecOutput {
+    let mut session_id = None;
+    let mut replies = Vec::new();
+    let mut event_lines = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(event) => {
+                if let Some(event_type) = event.get("type").and_then(|value| value.as_str()) {
+                    if event_type == "thread.started" {
+                        session_id = event
+                            .get("thread_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string);
+                    }
+                    if event_type == "item.completed" {
+                        let item = event.get("item").cloned().unwrap_or_default();
+                        if item.get("type").and_then(|value| value.as_str())
+                            == Some("agent_message")
+                        {
+                            if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                                replies.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some(formatted) = format_codex_cli_event_line(&event) {
+                    event_lines.push(formatted);
+                }
+            }
+            Err(_) => event_lines.push(format!("stdout {}", truncate_for_summary(trimmed, 160))),
+        }
+    }
+
+    let warning_lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let reply = replies.join("\n\n");
+    let summary = summarize_codex_cli_reply(&reply);
+    ParsedCodexCliExecOutput {
+        session_id,
+        reply,
+        summary,
+        event_lines,
+        warning_lines,
+    }
+}
+
+fn format_codex_cli_turn_reply(turn: &CodexCliTurnRecord) -> String {
+    let mut sections = vec![
+        format!("# Reply · {}", turn.recorded_at.to_rfc3339()),
+        format!("- **Engine:** `Codex CLI`"),
+        format!("- **Model:** `{}`", turn.model),
+    ];
+    if let Some(session_id) = turn.session_id.as_deref() {
+        sections.push(format!("- **Session:** `{session_id}`"));
+    }
+    sections.push("\n## Response Content".into());
+    if turn.reply.trim().is_empty() {
+        sections.push("\nNo agent_message reply was recorded for this CLI turn.".into());
+    } else {
+        sections.push(format!("\n{}", turn.reply.trim()));
+    }
+    if !turn.warning_lines.is_empty() {
+        sections.push("\n## CLI Warnings".into());
+        sections.extend(turn.warning_lines.iter().map(|line| format!("- {line}")));
+    }
+    sections.join("\n")
+}
+
+fn parse_codex_login_status(output: &str) -> (bool, Option<String>) {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return (false, None);
+    }
+    let logged_in = trimmed.contains("Logged in");
+    (logged_in, Some(trimmed.to_string()))
+}
+
 fn read_json_file<T>(path: PathBuf) -> anyhow::Result<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
@@ -5058,6 +5674,92 @@ fn queued_github_action_history_record(
         result_excerpt: None,
         result_url: None,
     }
+}
+
+fn format_runtime_turn_reply(turn: &RuntimeTurnRecord) -> String {
+    let mut sections = vec![
+        format!("# Reply · {}", turn.recorded_at.to_rfc3339()),
+        format!("- **Provider:** `{}`", turn.provider_id),
+        format!("- **Model:** `{}`", turn.model),
+        format!("- **Thread:** `{}`", turn.thread_id),
+        format!("- **Turn ID:** `{}`", turn.turn_id),
+    ];
+
+    if !turn.narrative.trim().is_empty() {
+        sections.push(format!("## Narrative\n\n{}", turn.narrative.trim()));
+    }
+
+    sections.push(format!(
+        "## Response Content\n\n{}",
+        format_response_content(&turn.response)
+    ));
+
+    if let Some(outcome) = &turn.tool_outcome {
+        sections.push(format!(
+            "## Recorded Tool Outcome\n\n{}",
+            format_serialized_value(outcome)
+        ));
+    }
+
+    if let Some(gap) = &turn.surfaced_gap {
+        sections.push(format!(
+            "## Surfaced Capability Gap\n\n{}",
+            format_serialized_value(gap)
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn format_response_content(response: &ChatResponse) -> String {
+    if response.content.is_empty() {
+        return "No response blocks were recorded for this provider round.".into();
+    }
+
+    response
+        .content
+        .iter()
+        .enumerate()
+        .map(|(index, block)| match block {
+            ContentBlock::Text { text } => {
+                let body = if text.trim().is_empty() {
+                    "The provider returned an empty text block.".to_string()
+                } else {
+                    text.trim().to_string()
+                };
+                format!("## Text Block {}\n\n{}", index + 1, body)
+            }
+            ContentBlock::ImagePath { path } => {
+                format!("## Image Block {}\n\n- **Path:** `{path}`", index + 1)
+            }
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => format!(
+                "## Tool Call {} · `{}`\n\n- **Call ID:** `{}`\n\n{}",
+                index + 1,
+                name,
+                id,
+                format_serialized_value(arguments)
+            ),
+            ContentBlock::ToolResult { id, content } => format!(
+                "## Tool Result {}\n\n- **Call ID:** `{}`\n\n{}",
+                index + 1,
+                id,
+                format_serialized_value(content)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn format_serialized_value<T>(value: &T) -> String
+where
+    T: Serialize,
+{
+    serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{}\"}}", error))
 }
 
 fn write_json_atomic<T>(path: &Path, value: &T) -> anyhow::Result<()>
@@ -5316,12 +6018,17 @@ fn recoverable_background_settings(snapshot: &OperatorSnapshot) -> Option<(RunSe
     if !matches!(status, "crashed" | "terminal_error") {
         return None;
     }
+    let engine_mode = match snapshot.background_runner_engine_mode.as_deref() {
+        Some("Codex CLI") => OperatorEngineMode::CodexCli,
+        _ => OperatorEngineMode::NativeHarness,
+    };
     Some((
         RunSettings {
             objective: snapshot.background_runner_objective.clone()?,
             model: snapshot.background_runner_model.clone()?,
             thread_id: snapshot.background_runner_thread_id.clone()?,
             thread_label: snapshot.background_runner_thread_label.clone()?,
+            engine_mode,
         },
         snapshot
             .background_runner_loop_pause_seconds
@@ -5397,6 +6104,7 @@ fn build_background_runner_state(
         model: settings.model.clone(),
         thread_id: settings.thread_id.clone(),
         thread_label: settings.thread_label.clone(),
+        engine_mode: settings.engine_mode,
         completed_turn_count,
         last_summary,
         last_error,
@@ -5569,6 +6277,128 @@ where
     }
 
     None
+}
+
+fn discover_codex_command_with<F>(get_env: F, allow_shell_probe: bool) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(path) = get_env("CODEX_BIN")
+        .as_deref()
+        .and_then(normalize_optional_text)
+        .map(PathBuf::from)
+    {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let appdata = get_env("APPDATA").or_else(|| env::var("APPDATA").ok());
+    if let Some(appdata) = appdata
+        .as_deref()
+        .and_then(normalize_optional_text)
+        .map(PathBuf::from)
+    {
+        for candidate in [
+            appdata.join("npm").join("codex.cmd"),
+            appdata.join("npm").join("codex"),
+            appdata.join("npm").join("codex.ps1"),
+        ] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for candidate in [
+        env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("codex"))),
+        env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("codex.exe"))),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if allow_shell_probe {
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(output) = Command::new("where.exe")
+                .arg("codex")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            {
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let candidate = PathBuf::from(line.trim());
+                        if candidate.exists() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn discover_codex_command() -> Option<PathBuf> {
+    discover_codex_command_with(|name| env::var(name).ok(), true)
+}
+
+fn codex_cli_status_with<F>(get_env: F, cwd: &Path) -> CodexCliStatus
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(path) = discover_codex_command_with(get_env, true) else {
+        return CodexCliStatus {
+            available: false,
+            logged_in: false,
+            summary: "blocked: install Codex CLI or set CODEX_BIN in operator.env".into(),
+            command_path: None,
+            account_summary: None,
+        };
+    };
+
+    let args = vec!["login".into(), "status".into()];
+    match run_command_checked(&path, cwd, &args) {
+        Ok(output) => {
+            let (logged_in, account_summary) = parse_codex_login_status(&output);
+            CodexCliStatus {
+                available: true,
+                logged_in,
+                summary: if logged_in {
+                    format!("ready via {} | {}", path.display(), output.trim())
+                } else {
+                    format!("available via {} | {}", path.display(), output.trim())
+                },
+                command_path: Some(path),
+                account_summary,
+            }
+        }
+        Err(error) => CodexCliStatus {
+            available: true,
+            logged_in: false,
+            summary: format!(
+                "login status unavailable via {} ({error:#})",
+                path.display()
+            ),
+            command_path: Some(path),
+            account_summary: None,
+        },
+    }
+}
+
+fn codex_cli_status(paths: &OperatorPaths) -> CodexCliStatus {
+    codex_cli_status_with(|name| env::var(name).ok(), &paths.repo_root)
 }
 
 fn discover_openclaw_command() -> Option<PathBuf> {
@@ -5940,10 +6770,12 @@ fn ensure_operator_env_template(path: &Path) -> anyhow::Result<()> {
         "# AGRO Harness operator environment",
         "# Fill the overrides you need, then relaunch the operator.",
         "# This file is loaded automatically for direct EXE and packaged launches.",
+        "# CODEX_BIN can point the GUI at an installed official Codex CLI and is the primary engine override.",
         "# OpenAI Codex can launch OAuth with the built-in client id by default.",
         "# OPENCLAW_BIN can point the GUI at an installed OpenClaw CLI for native Codex login.",
         "# OPENCLAW_STATE_DIR or OPENCLAW_AGENT_DIR can point the GUI at an existing OpenClaw auth store.",
         "",
+        "# CODEX_BIN=",
         "# SPLCW_OPENAI_CODEX_OAUTH_CLIENT_ID=",
         "# SPLCW_OPENAI_API_OAUTH_CLIENT_ID=",
         "# SPLCW_OPENAI_OAUTH_CLIENT_ID=",
@@ -6342,6 +7174,14 @@ fn parse_operator_command() -> anyhow::Result<OperatorCommand> {
             "--thread-id" => command.settings.thread_id = next_arg_value(&mut args, "--thread-id")?,
             "--thread-label" => {
                 command.settings.thread_label = next_arg_value(&mut args, "--thread-label")?
+            }
+            "--engine-mode" => {
+                command.settings.engine_mode =
+                    match next_arg_value(&mut args, "--engine-mode")?.as_str() {
+                        "codex_cli" => OperatorEngineMode::CodexCli,
+                        "native_harness" => OperatorEngineMode::NativeHarness,
+                        other => anyhow::bail!("unknown --engine-mode value '{other}'"),
+                    };
             }
             "--loop-pause-seconds" => {
                 let raw = next_arg_value(&mut args, "--loop-pause-seconds")?;
@@ -6970,24 +7810,27 @@ mod tests {
         DEFAULT_MODEL, DEFAULT_OBJECTIVE, DEFAULT_SESSION_ID, DEFAULT_THREAD_ID,
         DEFAULT_THREAD_LABEL, HarnessController, InteractiveOAuthLaunchStatus, OperatorApp,
         OperatorAuthProvider, OperatorBackgroundHandoffRequest, OperatorBackgroundRunnerState,
-        OperatorCommand, OperatorGithubActionLifecycleState, OperatorGithubActionRequestRecord,
-        OperatorGithubTargetSuggestion, OperatorPaths, OperatorRunMode, OperatorSnapshot,
-        OperatorTurnTerminal, RunSettings, apply_github_target_override,
-        apply_operator_env_assignments_with, background_reattach_recommendation,
-        background_recovery_action_label, background_runner_allows_spawn,
-        background_runner_owner_shell_alive, background_runner_process_is_alive,
-        bootstrap_background_runner_state, browser_callback_bind_target,
-        build_browser_callback_url, build_github_action_command, build_github_cli_context_from,
-        build_github_target_guidance, build_github_target_suggestions_from,
-        build_pending_oauth_view, build_project_artifact_context, build_repo_git_context_from,
-        classify_background_handoff, classify_background_runner, combine_optional_notices,
-        describe_auth_state, discover_openclaw_command_with, discover_repo_root,
+        OperatorCommand, OperatorEngineMode, OperatorGithubActionLifecycleState,
+        OperatorGithubActionRequestRecord, OperatorGithubTargetSuggestion, OperatorPaths,
+        OperatorRunMode, OperatorSnapshot, OperatorTurnTerminal, RunSettings,
+        apply_github_target_override, apply_operator_env_assignments_with,
+        background_reattach_recommendation, background_recovery_action_label,
+        background_runner_allows_spawn, background_runner_owner_shell_alive,
+        background_runner_process_is_alive, bootstrap_background_runner_state,
+        browser_callback_bind_target, build_browser_callback_url, build_github_action_command,
+        build_github_cli_context_from, build_github_target_guidance,
+        build_github_target_suggestions_from, build_pending_oauth_view,
+        build_project_artifact_context, build_repo_git_context_from, classify_background_handoff,
+        classify_background_runner, combine_optional_notices, describe_auth_state,
+        discover_codex_command_with, discover_openclaw_command_with, discover_repo_root,
         effective_operator_status, ensure_operator_env_template, extract_http_request_target,
-        format_background_runner_age, import_openclaw_plan_into_auth_store,
-        interactive_oauth_launch_status_with, load_openclaw_import_plan_from_paths,
-        maybe_bootstrap_openclaw_codex_auth_into_store, objective_needs_project_artifact_context,
-        openclaw_cli_status_with, operator_env_config_status, parse_operator_env_assignments,
-        pending_oauth_launch_url, provisional_background_runner_state, read_recent_jsonl_entries,
+        format_background_runner_age, format_runtime_turn_reply,
+        import_openclaw_plan_into_auth_store, interactive_oauth_launch_status_with,
+        load_openclaw_import_plan_from_paths, maybe_bootstrap_openclaw_codex_auth_into_store,
+        objective_needs_project_artifact_context, openclaw_cli_status_with,
+        operator_env_config_status, parse_codex_cli_exec_output, parse_codex_login_status,
+        parse_operator_env_assignments, pending_oauth_launch_url,
+        provisional_background_runner_state, read_recent_jsonl_entries,
         reconcile_crashed_background_runner, recoverable_background_settings,
         request_target_matches_callback_path, resolve_interactive_oauth_client_id_with, run_async,
         should_continue_run_loop, sleep_while_background_running, summarize_github_action_result,
@@ -6997,10 +7840,12 @@ mod tests {
     use chrono::{Duration, Utc};
     use serde::{Deserialize, Serialize};
     use splcw_llm::{
-        AuthMode, AuthProfile, AuthProfileStore, OAuthAuthorizationKind, OAuthState,
-        PendingOAuthAuthorization, ProviderKind,
+        AuthMode, AuthProfile, AuthProfileStore, ChatRequest, ChatResponse, ContentBlock,
+        OAuthAuthorizationKind, OAuthState, PendingOAuthAuthorization, ProviderKind,
     };
-    use splcw_orchestrator::{SupervisedGithubActionKind, SupervisedGithubActionRequest};
+    use splcw_orchestrator::{
+        RuntimeTurnRecord, SupervisedGithubActionKind, SupervisedGithubActionRequest,
+    };
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -7026,6 +7871,7 @@ mod tests {
             background_runner_path: operator_root.join("background-runner.json"),
             background_stop_path: operator_root.join("background-stop.request"),
             background_handoff_path: operator_root.join("background-handoff.json"),
+            codex_cli_session_path: operator_root.join("codex-cli-session.json"),
             session_root: operator_root.join("sessions"),
             session_id: DEFAULT_SESSION_ID.into(),
             state_db_path: operator_root.join("state.sqlite"),
@@ -7036,7 +7882,7 @@ mod tests {
     #[test]
     fn discover_repo_root_prefers_executable_path_over_launch_shell() -> anyhow::Result<()> {
         let root = tempdir()?;
-        let repo_root = root.path().join("FFR");
+        let repo_root = root.path().join("AIM");
         let exe_root = repo_root
             .join("artifacts")
             .join("ultimentality-pilot")
@@ -7136,6 +7982,48 @@ mod tests {
     }
 
     #[test]
+    fn format_runtime_turn_reply_preserves_text_and_tool_blocks() {
+        let reply = format_runtime_turn_reply(&RuntimeTurnRecord {
+            recorded_at: Utc::now(),
+            turn_id: Uuid::new_v4(),
+            thread_id: "main".into(),
+            provider_id: "openai-codex".into(),
+            model: "gpt-5.4".into(),
+            request: ChatRequest {
+                model: "gpt-5.4".into(),
+                system_prompt: None,
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            response: ChatResponse {
+                provider_id: "openai-codex".into(),
+                model: "gpt-5.4".into(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "The model answered in prose.".into(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call_123".into(),
+                        name: "capability_gap".into(),
+                        arguments: serde_json::json!({
+                            "title": "Need clearer target",
+                            "notes": ["one", "two"]
+                        }),
+                    },
+                ],
+            },
+            narrative: "The runtime recorded a narrative too.".into(),
+            tool_outcome: None,
+            surfaced_gap: None,
+        });
+
+        assert!(reply.contains("The model answered in prose."));
+        assert!(reply.contains("capability_gap"));
+        assert!(reply.contains("\"title\": \"Need clearer target\""));
+        assert!(reply.contains("The runtime recorded a narrative too."));
+    }
+
+    #[test]
     fn continuous_run_loop_only_continues_when_requested_and_safe() {
         assert!(should_continue_run_loop(
             OperatorRunMode::Continuous,
@@ -7168,7 +8056,7 @@ mod tests {
     fn build_github_action_command_maps_comment_issue_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::CommentIssue,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: Some(77),
             pull_request_number: None,
             body: Some("Operator-approved GitHub comment.".into()),
@@ -7185,7 +8073,7 @@ mod tests {
                 "comment",
                 "77",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--body",
                 "Operator-approved GitHub comment."
             ]
@@ -7196,7 +8084,7 @@ mod tests {
     fn build_github_action_command_maps_assign_issue_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::AssignIssue,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: Some(77),
             pull_request_number: None,
             body: None,
@@ -7213,7 +8101,7 @@ mod tests {
                 "edit",
                 "77",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--add-assignee",
                 "@me"
             ]
@@ -7244,7 +8132,7 @@ mod tests {
     fn build_github_action_command_maps_label_issue_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::LabelIssue,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: Some(77),
             pull_request_number: None,
             body: None,
@@ -7261,7 +8149,7 @@ mod tests {
                 "edit",
                 "77",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--add-label",
                 "needs-repro"
             ]
@@ -7272,7 +8160,7 @@ mod tests {
     fn build_github_action_command_maps_remove_label_issue_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::RemoveLabelIssue,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: Some(77),
             pull_request_number: None,
             body: None,
@@ -7289,7 +8177,7 @@ mod tests {
                 "edit",
                 "77",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--remove-label",
                 "needs-repro"
             ]
@@ -7300,7 +8188,7 @@ mod tests {
     fn build_github_action_command_maps_close_issue_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::CloseIssue,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: Some(88),
             pull_request_number: None,
             body: Some("Closing this now that the supervised lane landed.".into()),
@@ -7317,7 +8205,7 @@ mod tests {
                 "close",
                 "88",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--comment",
                 "Closing this now that the supervised lane landed."
             ]
@@ -7328,7 +8216,7 @@ mod tests {
     fn build_github_action_command_maps_close_pull_request_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::ClosePullRequest,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: None,
             pull_request_number: Some(101),
             body: Some("Closing this PR now that the supervised lane landed.".into()),
@@ -7345,7 +8233,7 @@ mod tests {
                 "close",
                 "101",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--comment",
                 "Closing this PR now that the supervised lane landed."
             ]
@@ -7356,7 +8244,7 @@ mod tests {
     fn build_github_action_command_maps_reopen_issue_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::ReopenIssue,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: Some(88),
             pull_request_number: None,
             body: Some("Reopening this issue so follow-up work stays visible.".into()),
@@ -7373,7 +8261,7 @@ mod tests {
                 "reopen",
                 "88",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--comment",
                 "Reopening this issue so follow-up work stays visible."
             ]
@@ -7384,7 +8272,7 @@ mod tests {
     fn build_github_action_command_maps_reopen_pull_request_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::ReopenPullRequest,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: None,
             pull_request_number: Some(101),
             body: Some("Reopening this PR so review can continue.".into()),
@@ -7401,7 +8289,7 @@ mod tests {
                 "reopen",
                 "101",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--comment",
                 "Reopening this PR so review can continue."
             ]
@@ -7412,7 +8300,7 @@ mod tests {
     fn build_github_action_command_maps_assign_pull_request_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::AssignPullRequest,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: None,
             pull_request_number: Some(101),
             body: None,
@@ -7429,7 +8317,7 @@ mod tests {
                 "edit",
                 "101",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--add-assignee",
                 "@copilot"
             ]
@@ -7440,7 +8328,7 @@ mod tests {
     fn build_github_action_command_maps_remove_label_pull_request_requests() {
         let command = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::RemoveLabelPullRequest,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: None,
             pull_request_number: Some(101),
             body: None,
@@ -7457,7 +8345,7 @@ mod tests {
                 "edit",
                 "101",
                 "--repo",
-                "jessybrenenstahl/FFR",
+                "jessybrenenstahl/AIM",
                 "--remove-label",
                 "needs-review"
             ]
@@ -7468,7 +8356,7 @@ mod tests {
     fn apply_github_target_override_fills_missing_pull_request_target() {
         let request = SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::CommentPullRequest,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: None,
             pull_request_number: None,
             body: Some("Operator-approved GitHub comment.".into()),
@@ -7488,7 +8376,7 @@ mod tests {
     fn build_github_action_command_rejects_missing_target() {
         let error = build_github_action_command(&SupervisedGithubActionRequest {
             kind: SupervisedGithubActionKind::CommentPullRequest,
-            repository: Some("jessybrenenstahl/FFR".into()),
+            repository: Some("jessybrenenstahl/AIM".into()),
             issue_number: None,
             pull_request_number: None,
             body: Some("Operator-approved GitHub comment.".into()),
@@ -7520,7 +8408,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("body".into()),
@@ -7529,12 +8417,12 @@ mod tests {
                 justification: None,
             },
             SupervisedGithubActionKind::CommentPullRequest,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             Some(
-                r#"[{"number":17,"title":"Current branch PR","url":"https://example.com/pr/17","headRefName":"codex/splcw-harness-foundation"}]"#,
+                r#"[{"number":17,"title":"Current branch PR","url":"https://example.com/pr/17","headRefName":"main"}]"#,
             ),
             Some(
-                r#"[{"number":17,"title":"Current branch PR","url":"https://example.com/pr/17","headRefName":"codex/splcw-harness-foundation"},{"number":11,"title":"Other PR","url":"https://example.com/pr/11","headRefName":"codex/other"}]"#,
+                r#"[{"number":17,"title":"Current branch PR","url":"https://example.com/pr/17","headRefName":"main"},{"number":11,"title":"Other PR","url":"https://example.com/pr/11","headRefName":"codex/other"}]"#,
             ),
             None,
         );
@@ -7544,7 +8432,7 @@ mod tests {
         assert!(
             suggestions[0]
                 .source
-                .contains("codex/splcw-harness-foundation")
+                .contains("main")
         );
         assert_eq!(suggestions[1].number, 11);
         assert!(suggestions[1].source.contains("recent open PR"));
@@ -7555,7 +8443,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("body".into()),
@@ -7564,7 +8452,7 @@ mod tests {
                 justification: None,
             },
             SupervisedGithubActionKind::CommentIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(
@@ -7583,7 +8471,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::LabelIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: None,
@@ -7592,7 +8480,7 @@ mod tests {
                 justification: None,
             },
             SupervisedGithubActionKind::LabelIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(r#"[{"number":17,"title":"Label me","url":"https://example.com/issues/17"}]"#),
@@ -7608,7 +8496,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::RemoveLabelIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: None,
@@ -7617,7 +8505,7 @@ mod tests {
                 justification: None,
             },
             SupervisedGithubActionKind::RemoveLabelIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(
@@ -7635,7 +8523,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::AssignIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: None,
@@ -7644,7 +8532,7 @@ mod tests {
                 justification: Some("Assign the crash recovery issue.".into()),
             },
             SupervisedGithubActionKind::AssignIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(
@@ -7662,7 +8550,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CloseIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("Close the shipped GitHub supervision gap.".into()),
@@ -7671,7 +8559,7 @@ mod tests {
                 justification: Some("The shipped lane should close the tracking issue.".into()),
             },
             SupervisedGithubActionKind::CloseIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(
@@ -7689,7 +8577,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::ClosePullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("Close the crash recovery PR now that the replacement landed.".into()),
@@ -7698,7 +8586,7 @@ mod tests {
                 justification: Some("Crash recovery PR cleanup should be supervised.".into()),
             },
             SupervisedGithubActionKind::ClosePullRequest,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             Some(
                 r#"[{"number":11,"title":"Misc cleanup","url":"https://example.com/pr/11","headRefName":"codex/misc"},{"number":24,"title":"Close crash recovery PR after replacement","url":"https://example.com/pr/24","headRefName":"codex/recovery"}]"#,
@@ -7716,7 +8604,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::ReopenIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("Reopen the crash recovery tracking issue.".into()),
@@ -7725,7 +8613,7 @@ mod tests {
                 justification: Some("The tracking issue still needs follow-up.".into()),
             },
             SupervisedGithubActionKind::ReopenIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(
@@ -7743,7 +8631,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::ReopenPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("Reopen the crash recovery PR for follow-up review.".into()),
@@ -7752,7 +8640,7 @@ mod tests {
                 justification: Some("The pull request still needs supervised follow-up.".into()),
             },
             SupervisedGithubActionKind::ReopenPullRequest,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             Some(
                 r#"[{"number":12,"title":"Misc cleanup","url":"https://example.com/pr/12","headRefName":"codex/misc"},{"number":36,"title":"Reopen crash recovery PR for follow-up","url":"https://example.com/pr/36","headRefName":"codex/recovery"}]"#,
@@ -7770,7 +8658,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::RemoveLabelPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: None,
@@ -7779,7 +8667,7 @@ mod tests {
                 justification: Some("Remove the stale label after supervised review.".into()),
             },
             SupervisedGithubActionKind::RemoveLabelPullRequest,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             Some(
                 r#"[{"number":15,"title":"Misc cleanup","url":"https://example.com/pr/15","headRefName":"codex/misc"},{"number":41,"title":"Remove stale review label guidance","url":"https://example.com/pr/41","headRefName":"codex/review"}]"#,
@@ -7797,7 +8685,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::AssignPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: None,
@@ -7806,7 +8694,7 @@ mod tests {
                 justification: Some("Assign the review follow-up PR.".into()),
             },
             SupervisedGithubActionKind::AssignPullRequest,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             Some(
                 r#"[{"number":18,"title":"Misc cleanup","url":"https://example.com/pr/18","headRefName":"codex/misc"},{"number":45,"title":"Assign review follow-up PR","url":"https://example.com/pr/45","headRefName":"codex/review"}]"#,
@@ -7824,7 +8712,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("Please comment on the crash recovery relaunch path.".into()),
@@ -7833,7 +8721,7 @@ mod tests {
                 justification: Some("Crash recovery relaunch hardening is the focus.".into()),
             },
             SupervisedGithubActionKind::CommentPullRequest,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             Some(
                 r#"[{"number":22,"title":"Misc cleanup","url":"https://example.com/pr/22","headRefName":"codex/misc"},{"number":31,"title":"Harden crash recovery relaunch flow","url":"https://example.com/pr/31","headRefName":"codex/recovery"}]"#,
@@ -7851,7 +8739,7 @@ mod tests {
         let suggestions = build_github_target_suggestions_from(
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("Need an issue about crash recovery relaunch guidance.".into()),
@@ -7860,7 +8748,7 @@ mod tests {
                 justification: Some("Crash recovery guidance should be tracked.".into()),
             },
             SupervisedGithubActionKind::CommentIssue,
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             None,
             None,
             Some(
@@ -7880,7 +8768,7 @@ mod tests {
             &test_operator_paths(root.path()),
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("body".into()),
@@ -7904,7 +8792,7 @@ mod tests {
             &test_operator_paths(root.path()),
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentIssue,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("body".into()),
@@ -7927,7 +8815,7 @@ mod tests {
             &test_operator_paths(root.path()),
             &SupervisedGithubActionRequest {
                 kind: SupervisedGithubActionKind::CommentPullRequest,
-                repository: Some("jessybrenenstahl/FFR".into()),
+                repository: Some("jessybrenenstahl/AIM".into()),
                 issue_number: None,
                 pull_request_number: None,
                 body: Some("body".into()),
@@ -7939,7 +8827,7 @@ mod tests {
                 number: 17,
                 title: "Current branch PR".into(),
                 url: Some("https://example.com/pr/17".into()),
-                source: "open PR for codex/splcw-harness-foundation".into(),
+                source: "open PR for main".into(),
             }],
         )
         .expect("guidance");
@@ -8442,6 +9330,26 @@ mod tests {
     }
 
     #[test]
+    fn discover_codex_command_finds_appdata_npm_shim() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let npm_dir = root.path().join("npm");
+        std::fs::create_dir_all(&npm_dir)?;
+        let codex = npm_dir.join("codex.cmd");
+        std::fs::write(&codex, "@echo off\r\n")?;
+
+        let resolved = discover_codex_command_with(
+            |name| match name {
+                "APPDATA" => Some(root.path().display().to_string()),
+                _ => None,
+            },
+            false,
+        );
+
+        assert_eq!(resolved, Some(codex));
+        Ok(())
+    }
+
+    #[test]
     fn openclaw_cli_status_reports_appdata_npm_shim() -> anyhow::Result<()> {
         let root = tempdir()?;
         let npm_dir = root.path().join("npm");
@@ -8458,6 +9366,46 @@ mod tests {
         assert_eq!(status.command_path, Some(openclaw.clone()));
         assert!(status.summary.contains(&openclaw.display().to_string()));
         Ok(())
+    }
+
+    #[test]
+    fn parse_codex_login_status_detects_logged_in_cli() {
+        let (logged_in, summary) =
+            parse_codex_login_status("Logged in using ChatGPT\nAccount: test-user");
+        assert!(logged_in);
+        assert_eq!(
+            summary.as_deref(),
+            Some("Logged in using ChatGPT\nAccount: test-user")
+        );
+    }
+
+    #[test]
+    fn parse_codex_cli_exec_output_collects_session_reply_and_events() {
+        let stdout = r#"{"type":"thread.started","thread_id":"thread-123"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"CLI reply body"}}
+{"type":"turn.completed"}"#;
+        let stderr = "warning: cli warning";
+        let parsed = parse_codex_cli_exec_output(stdout, stderr);
+        assert_eq!(parsed.session_id.as_deref(), Some("thread-123"));
+        assert_eq!(parsed.reply, "CLI reply body");
+        assert!(parsed.summary.contains("CLI reply body"));
+        assert!(
+            parsed
+                .event_lines
+                .iter()
+                .any(|line| line == "thread.started thread-123")
+        );
+        assert!(
+            parsed
+                .event_lines
+                .iter()
+                .any(|line| line == "turn.completed")
+        );
+        assert_eq!(
+            parsed.warning_lines,
+            vec!["warning: cli warning".to_string()]
+        );
     }
 
     #[test]
@@ -8730,19 +9678,19 @@ mod tests {
     fn build_repo_git_context_reports_branch_status_and_commits() {
         let context = build_repo_git_context_from(
             Path::new("C:\\repo"),
-            Some("codex/splcw-harness-foundation"),
+            Some("main"),
             Some("f8899e77cd4797a127d3e04df7fa0e4b0959f720"),
-            Some("origin/codex/splcw-harness-foundation"),
-            Some("https://github.com/jessybrenenstahl/FFR"),
+            Some("origin/main"),
+            Some("https://github.com/jessybrenenstahl/AIM"),
             Some(
-                "## codex/splcw-harness-foundation...origin/codex/splcw-harness-foundation\n M ultimentality-pilot/harness/README.md\n?? offload/history/\n",
+                "## main...origin/main\n M ultimentality-pilot/harness/README.md\n?? offload/history/\n",
             ),
             Some("f8899e7 Add operator shell reattach ownership\n97bbe6e Keep operator handoff ownership target-scoped"),
         )
         .expect("expected repo context");
 
         assert!(context.contains("## Repo / GitHub Context"));
-        assert!(context.contains("branch: codex/splcw-harness-foundation"));
+        assert!(context.contains("branch: main"));
         assert!(context.contains("tracked worktree: 1 tracked change(s)"));
         assert!(context.contains("untracked entries: 1"));
         assert!(context.contains("Recent Commits"));
@@ -8753,22 +9701,22 @@ mod tests {
     fn build_github_cli_context_reports_repo_prs_and_issues() {
         let context = build_github_cli_context_from(
             Some(
-                "- repo: jessybrenenstahl/FFR\n- url: https://github.com/jessybrenenstahl/FFR\n- default branch: codex/splcw-harness-foundation\n",
+                "- repo: jessybrenenstahl/AIM\n- url: https://github.com/jessybrenenstahl/AIM\n- default branch: main\n",
             ),
             Some(
-                "- #101 Add operator shell reattach ownership [OPEN] head=codex/splcw-harness-foundation base=main https://github.com/jessybrenenstahl/FFR/pull/101",
+                "- #101 Add operator shell reattach ownership [OPEN] head=main base=main https://github.com/jessybrenenstahl/AIM/pull/101",
             ),
             Some(
-                "- #102 Add bounded repo context [OPEN] head=codex/repo-context base=main https://github.com/jessybrenenstahl/FFR/pull/102",
+                "- #102 Add bounded repo context [OPEN] head=codex/repo-context base=main https://github.com/jessybrenenstahl/AIM/pull/102",
             ),
             Some(
-                "- #77 Give harness GitHub access [OPEN] https://github.com/jessybrenenstahl/FFR/issues/77",
+                "- #77 Give harness GitHub access [OPEN] https://github.com/jessybrenenstahl/AIM/issues/77",
             ),
         )
         .expect("expected GitHub context");
 
         assert!(context.contains("## GitHub Remote Context"));
-        assert!(context.contains("repo: jessybrenenstahl/FFR"));
+        assert!(context.contains("repo: jessybrenenstahl/AIM"));
         assert!(context.contains("Pull Requests For Current Branch"));
         assert!(context.contains("Recent Open Pull Requests"));
         assert!(context.contains("Recent Open Issues"));
@@ -8864,6 +9812,11 @@ mod tests {
                 .join("ultimentality-pilot")
                 .join("operator")
                 .join("background-handoff.json"),
+            codex_cli_session_path: repo_root
+                .join("artifacts")
+                .join("ultimentality-pilot")
+                .join("operator")
+                .join("codex-cli-session.json"),
             session_root: repo_root
                 .join("artifacts")
                 .join("ultimentality-pilot")
@@ -9019,6 +9972,7 @@ mod tests {
         let path = root.path().join("operator.env");
         ensure_operator_env_template(&path)?;
         let body = std::fs::read_to_string(&path)?;
+        assert!(body.contains("CODEX_BIN"));
         assert!(body.contains("SPLCW_OPENAI_CODEX_OAUTH_CLIENT_ID"));
         assert!(body.contains("OPENCLAW_STATE_DIR"));
         assert!(body.contains("loaded automatically"));
@@ -9040,6 +9994,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9072,6 +10027,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop stopped cleanly".into()),
             last_error: None,
@@ -9104,6 +10060,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop failed after 3 turn(s)".into()),
             last_error: Some("synthetic detached runner failure".into()),
@@ -9136,6 +10093,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9169,6 +10127,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 1,
             last_summary: Some("background runner 4242 exited during running_turn".into()),
             last_error: Some("runner died".into()),
@@ -9208,6 +10167,7 @@ mod tests {
             background_runner_model: Some("gpt-5.4".into()),
             background_runner_thread_id: Some("ops".into()),
             background_runner_thread_label: Some("Operations".into()),
+            background_runner_engine_mode: Some("Codex CLI".into()),
             background_runner_loop_pause_seconds: Some(7.5),
             ..OperatorSnapshot::default()
         };
@@ -9218,6 +10178,7 @@ mod tests {
         assert_eq!(settings.model, "gpt-5.4");
         assert_eq!(settings.thread_id, "ops");
         assert_eq!(settings.thread_label, "Operations");
+        assert_eq!(settings.engine_mode, OperatorEngineMode::CodexCli);
         assert!((pause - 7.5).abs() < 0.01);
     }
 
@@ -9283,6 +10244,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 1,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9306,6 +10268,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 1,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9328,6 +10291,7 @@ mod tests {
         assert!(!command.background_loop);
         assert_eq!(command.settings.objective, DEFAULT_OBJECTIVE);
         assert_eq!(command.settings.model, DEFAULT_MODEL);
+        assert_eq!(command.settings.engine_mode, OperatorEngineMode::CodexCli);
         assert_eq!(command.loop_pause_seconds, 0.0);
         assert!(command.background_runner_id.is_none());
     }
@@ -9343,6 +10307,7 @@ mod tests {
             background_runner_model: Some(DEFAULT_MODEL.into()),
             background_runner_thread_id: Some(DEFAULT_THREAD_ID.into()),
             background_runner_thread_label: Some(DEFAULT_THREAD_LABEL.into()),
+            background_runner_engine_mode: Some("Codex CLI".into()),
             background_runner_loop_pause_seconds: Some(DEFAULT_LOOP_PAUSE_SECONDS),
             ..OperatorSnapshot::default()
         };
@@ -9364,6 +10329,7 @@ mod tests {
             background_runner_model: Some("gpt-5.4-mini".into()),
             background_runner_thread_id: Some("ops".into()),
             background_runner_thread_label: Some("Operations".into()),
+            background_runner_engine_mode: Some("Native Harness".into()),
             background_runner_loop_pause_seconds: Some(4.5),
             ..OperatorSnapshot::default()
         };
@@ -9374,6 +10340,7 @@ mod tests {
         assert_eq!(app.settings.model, "gpt-5.4-mini");
         assert_eq!(app.settings.thread_id, "ops");
         assert_eq!(app.settings.thread_label, "Operations");
+        assert_eq!(app.settings.engine_mode, OperatorEngineMode::NativeHarness);
         assert!((app.loop_pause_seconds - 4.5).abs() < 0.01);
         let updated_snapshot = app
             .snapshot
@@ -9401,6 +10368,7 @@ mod tests {
             background_handoff_model: Some(DEFAULT_MODEL.into()),
             background_handoff_thread_id: Some(DEFAULT_THREAD_ID.into()),
             background_handoff_thread_label: Some(DEFAULT_THREAD_LABEL.into()),
+            background_handoff_engine_mode: Some("Codex CLI".into()),
             background_handoff_loop_pause_seconds: Some(DEFAULT_LOOP_PAUSE_SECONDS),
             ..OperatorSnapshot::default()
         };
@@ -9423,6 +10391,7 @@ mod tests {
             background_handoff_model: Some("gpt-5.4-mini".into()),
             background_handoff_thread_id: Some("ops".into()),
             background_handoff_thread_label: Some("Operations".into()),
+            background_handoff_engine_mode: Some("Native Harness".into()),
             background_handoff_loop_pause_seconds: Some(5.0),
             ..OperatorSnapshot::default()
         };
@@ -9433,6 +10402,7 @@ mod tests {
         assert_eq!(app.settings.model, "gpt-5.4-mini");
         assert_eq!(app.settings.thread_id, "ops");
         assert_eq!(app.settings.thread_label, "Operations");
+        assert_eq!(app.settings.engine_mode, OperatorEngineMode::NativeHarness);
         assert!((app.loop_pause_seconds - 5.0).abs() < 0.01);
         let updated_snapshot = app
             .snapshot
@@ -9470,6 +10440,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9555,6 +10526,7 @@ mod tests {
             model: settings.model.clone(),
             thread_id: settings.thread_id.clone(),
             thread_label: settings.thread_label.clone(),
+            engine_mode: settings.engine_mode,
             completed_turn_count: 0,
             last_summary: Some("background loop launching".into()),
             last_error: None,
@@ -9599,6 +10571,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("stale runner".into()),
             last_error: None,
@@ -9639,6 +10612,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 2,
             last_summary: Some("fresh runner".into()),
             last_error: None,
@@ -9675,6 +10649,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9755,6 +10730,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 2,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9791,6 +10767,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 4,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9844,6 +10821,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 4,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9891,6 +10869,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 7,
             last_summary: Some("background loop failed after 7 turn(s)".into()),
             last_error: Some("synthetic worker failure".into()),
@@ -9940,6 +10919,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -9983,6 +10963,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 4,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -10021,6 +11002,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 4,
             last_summary: Some("waiting".into()),
             last_error: None,
@@ -10083,6 +11065,7 @@ mod tests {
             model: "gpt-5.4".into(),
             thread_id: "main".into(),
             thread_label: "Main".into(),
+            engine_mode: OperatorEngineMode::NativeHarness,
             completed_turn_count: 3,
             last_summary: Some("background loop active".into()),
             last_error: None,
@@ -10143,3 +11126,4 @@ mod tests {
         assert!(age.starts_with("2m"));
     }
 }
+

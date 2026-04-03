@@ -1,4 +1,5 @@
 /target
+/ultimentality-pilot/harness/target/
 /artifacts/ultimentality-pilot/operator/
 operator.env
 *.env

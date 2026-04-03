@@ -16,6 +16,7 @@ splcw-host = { path = "../splcw-host" }
 splcw-llm = { path = "../splcw-llm" }
 splcw-memory = { path = "../splcw-memory" }
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

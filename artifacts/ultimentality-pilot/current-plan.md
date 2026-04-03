@@ -1,24 +1,36 @@
 ## Current Plan
 
-AIM clean-slate recovery — April 3, 2026.
+AIM source-of-truth recovery — April 3, 2026.
 
-### Phase: Clean Baseline → CLI/Gateway Seam
+### Phase: CLI-First Operator Recovery
 
-1. Apply `CLEANUP_GUIDE.md` to the three restored crates (`splcw-llm`, `splcw-orchestrator`, `splcw-operator-gui`).
-2. Lift the three patch modules (`host_verify_retry`, `gap_task_emitter`, `compaction_publisher`) directly into `splcw-orchestrator`.
-3. Wire always-on operating memory injection (`os.md`, `memory.md`) into `run_runtime_turn`.
-4. Define the CLI/gateway-backed session seam in `splcw-orchestrator` (import OpenClaw lane serialization posture).
-5. Verify: `cargo build` passes, `cargo test` passes, no `NATIVE_CODEX_ENGINE_LABEL` in any source.
+Completed in this slice:
 
-### Next After Clean Baseline
+1. Migrated the strongest operator shell from `FFR` into `AIM` and scrubbed repo/branch drift markers.
+2. Restored a checked-in packaging and launcher path under `ultimentality-pilot/harness/`.
+3. Repointed the CLI context bundle at AIM canonical memory/context surfaces:
+   - `artifacts/ultimentality-pilot/memory/os.md`
+   - `artifacts/ultimentality-pilot/memory/memory.md`
+   - `artifacts/ultimentality-pilot/baseline/clean-splcw-harness-2026-04-03.md`
+   - `ultimentality-pilot/harness/ARCHITECTURE.md`
+4. Verified the operator crate in AIM with:
+   - `cargo check -p splcw-operator-gui`
+   - `cargo test -p splcw-operator-gui`
+   - packaged smoke test from the checked-in operator executable
 
-- Deepen auth controller lifecycle (OpenClaw-style profile rotation, cooldown, refresh scheduling).
-- Harden compaction continuity transactions (mirror publish, snapshot/retry/fallback).
-- Strengthen fail-closed verification (stabilization retry now lifted from patches).
-- Begin thread-first continuity beyond recent-turn summaries.
+### Immediate Next Work
+
+1. Make the Codex CLI lane the default usable path in AIM even when no legacy OAuth profile is present in operator state.
+2. Rework the GPUI shell toward a real workbench:
+   - transcript-first layout
+   - clearer CLI session proof
+   - better compose/reply flow
+   - less admin-dashboard framing
+3. Audit memory/tool grounding end-to-end so every CLI turn gets the canonical operating memory without relying on brittle heuristics.
+4. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
 
 ### What Not To Do
 
-- Do not add GUI features before the session seam is defined.
-- Do not expand macOS parity before continuity is harder.
-- Do not add more operator surface breadth before the harness core is trustworthy.
+- Do not reintroduce `FFR` repo assumptions or branch names.
+- Do not grow fallback-provider UX into the primary path.
+- Do not add more surface breadth if it hides whether Codex CLI is actually connected and grounded.

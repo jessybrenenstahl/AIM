@@ -1,6 +1,6 @@
 # Open Gaps
 
-- lead gap: restored crates need cleanup surgery per CLEANUP_GUIDE.md before the harness is architecturally clean
-- always-on memory injection not yet wired into run_runtime_turn
-- CLI/gateway session seam not yet defined (OpenClaw lane serialization posture not yet imported)
-- host_verify_retry, gap_task_emitter, compaction_publisher not yet lifted from patches into splcw-orchestrator proper
+- lead gap: the AIM operator still presents as partially admin/dashboard-shaped instead of a humane CLI workbench
+- Codex CLI is available in smoke tests, but AIM operator state still reports no default legacy auth profile; the CLI lane must stay usable without that mismatch confusing the user
+- canonical operating memory exists, but the end-to-end CLI turn path still needs a stricter audit so every turn is grounded in `os.md`, `memory.md`, and current continuity truth
+- deeper continuity/substrate work remains after the CLI-first operator path is solid

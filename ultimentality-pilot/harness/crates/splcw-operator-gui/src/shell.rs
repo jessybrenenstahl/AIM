@@ -1,7 +1,8 @@
 use super::*;
 use gpui::{
-    AnyElement, App, Context, Entity, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
-    ParentElement as _, Render, SharedString, Styled as _, Timer, Window, actions, div, px, rems,
+    AnyElement, App, ClipboardItem, Context, Entity, Hsla, InteractiveElement as _, IntoElement,
+    KeyBinding, ParentElement as _, Render, SharedString, Styled as _, Timer, Window, actions, div,
+    px, rems,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, StyledExt as _, h_flex,
@@ -13,6 +14,12 @@ use gpui_component::{
 use gpui_component::{button::Button, button::ButtonVariants as _};
 
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CLI_CODEX_ENGINE_LABEL: &str = "Codex CLI";
+const CLI_CODEX_ENGINE_SUMMARY: &str =
+    "Official Codex CLI is the primary engine. The GUI launches real Codex CLI login and `codex exec/resume` turns.";
+const FALLBACK_PROVIDER_LABEL: &str = "Provider Fallback";
+const FALLBACK_PROVIDER_SUMMARY: &str =
+    "This lane exists only as a fallback or debugging path when the primary Codex CLI lane is unavailable.";
 const SHELL_CONTEXT: &str = "OperatorShell";
 const ZOOM_MIN: f32 = 0.70;
 const ZOOM_MAX: f32 = 1.65;
@@ -22,6 +29,7 @@ const DOC_SURFACE_MIN_REM: f32 = 12.0;
 #[derive(Clone, Copy)]
 enum DocumentSurfaceMode {
     Fit,
+    Scroll,
 }
 
 actions!(operator_shell, [ZoomIn, ZoomOut, ResetZoom]);
@@ -161,12 +169,7 @@ fn render_document_line(line: &str) -> AnyElement {
             .min_w_0()
             .items_start()
             .gap_2()
-            .child(
-                div()
-                    .pt_0p5()
-                    .text_color(gpui::rgb(0x6eb6ff))
-                    .child("•"),
-            )
+            .child(div().pt_0p5().text_color(gpui::rgb(0x6eb6ff)).child("•"))
             .child(
                 div()
                     .flex_1()
@@ -219,7 +222,7 @@ impl OperatorPanel {
                 "Launch bounded turns, inspect runtime identity, and keep the live session understandable."
             }
             Self::Auth => {
-                "Manage provider auth, inspect pending OAuth, and verify the selected provider is ready."
+                "Manage the primary Codex CLI login plus the native fallback auth lane without confusing the two."
             }
             Self::Background => {
                 "Own detached runner state, handoffs, crash recovery, and reattach behavior from one place."
@@ -376,6 +379,7 @@ impl OperatorShell {
         self.app.settings.model = self.model_input.read(cx).value().to_string();
         self.app.settings.thread_id = self.thread_id_input.read(cx).value().to_string();
         self.app.settings.thread_label = self.thread_label_input.read(cx).value().to_string();
+        self.app.settings.engine_mode = self.app.engine_mode;
         self.app.auth_label = self.auth_label_input.read(cx).value().to_string();
         self.app.auth_callback_input = self.auth_callback_input.read(cx).value().to_string();
         self.app.github_target_input = self.github_target_input.read(cx).value().to_string();
@@ -446,6 +450,12 @@ impl OperatorShell {
         cx.notify();
     }
 
+    fn select_engine_mode(&mut self, engine_mode: OperatorEngineMode, cx: &mut Context<Self>) {
+        self.app.engine_mode = engine_mode;
+        self.app.settings.engine_mode = engine_mode;
+        cx.notify();
+    }
+
     fn adopt_background_settings(
         &mut self,
         snapshot: &OperatorSnapshot,
@@ -486,11 +496,15 @@ impl OperatorShell {
     ) -> impl IntoElement {
         let provider = self.app.auth_provider;
         let background_active = snapshot.background_runner_active;
-        let auth_ready = snapshot.auth_ready;
+        let auth_ready = self.app.selected_engine_ready(snapshot);
+        let engine_label = match self.app.engine_mode {
+            OperatorEngineMode::CodexCli => CLI_CODEX_ENGINE_LABEL,
+            OperatorEngineMode::NativeHarness => FALLBACK_PROVIDER_LABEL,
+        };
 
         let mut pills = vec![
             status_pill(
-                "AGRO Operator",
+                engine_label,
                 cx.theme().secondary,
                 cx.theme().secondary_foreground,
             ),
@@ -760,7 +774,7 @@ impl OperatorShell {
     ) -> AnyElement {
         let auth_busy = self.app.auth_working.load(Ordering::SeqCst);
         let background_active = snapshot.background_runner_active;
-        let can_run = snapshot.auth_ready
+        let can_run = self.app.selected_engine_ready(snapshot)
             && !self.app.running.load(Ordering::SeqCst)
             && !auth_busy
             && !background_active;
@@ -773,15 +787,22 @@ impl OperatorShell {
         let handoff_pending = snapshot.background_handoff_pending;
         let handoff_settings_match =
             handoff_pending && self.app.handoff_settings_match_form(snapshot);
-        let provider_retry_needed = provider_retry_needed(snapshot);
-        let provider_recovery_surface = if provider_retry_needed {
-            empty_state(
+        let provider_retry_needed =
+            matches!(self.app.engine_mode, OperatorEngineMode::NativeHarness)
+                && provider_retry_needed(snapshot);
+        let prompt_draft = self.objective_input.read(cx).value().to_string();
+        let provider_recovery_surface = match self.app.engine_mode {
+            OperatorEngineMode::CodexCli if !snapshot.codex_cli_logged_in => empty_state(
+                "Codex CLI login is required",
+                "Use the Auth page to launch `codex login`. Once the CLI is logged in, this panel will use real `codex exec/resume` turns instead of the old native client path.",
+                cx,
+            ),
+            OperatorEngineMode::NativeHarness if provider_retry_needed => empty_state(
                 "Provider step needs recovery",
                 "Auth is already complete. The last bounded attempt failed before the next provider/model step finished. Retry the turn, or run Auth Preflight if you want to re-check the provider session first.",
                 cx,
-            )
-        } else {
-            div().into_any_element()
+            ),
+            _ => div().into_any_element(),
         };
 
         page_scroll(
@@ -796,54 +817,64 @@ impl OperatorShell {
                                 .flex_1()
                                 .min_w_0()
                                 .child(card(
-                                    "Harnessed Model",
+                                    "Session Transcript",
                                     Some(
-                                        "This is the live proof that the model is authenticated, callable, and driving bounded runtime turns.",
+                                        "The center of this screen should be the actual Codex session, with full replies visible and scrollable.",
                                     ),
                                     document_surface(
-                                        "operate-harnessed-model",
-                                        build_harnessed_model_markdown(
-                                            self.app.auth_provider,
+                                        "operate-conversation",
+                                        build_conversation_markdown(
+                                            self.app.engine_mode,
                                             snapshot,
-                                            &self.app.settings,
+                                            &prompt_draft,
                                         ),
                                         self.zoom_scale,
-                                        10.0,
-                                        Some(20.0),
-                                        DocumentSurfaceMode::Fit,
+                                        24.0,
+                                        Some(40.0),
+                                        DocumentSurfaceMode::Scroll,
                                         window,
                                         cx,
                                     ),
                                 ))
                                 .child(card(
-                                    "Objective",
+                                    "Prompt Composer",
                                     Some(
-                                        "This is the primary task contract for the next bounded turn or loop.",
+                                        "Write the next bounded instruction here, then send one turn or let the loop continue once the target is grounded.",
                                     ),
                                     v_flex()
                                         .gap_3()
-                                        .child(Input::new(&self.objective_input).h(px(220.0)))
                                         .child(
                                             h_flex()
-                                                .gap_3()
-                                                .items_start()
+                                                .gap_2()
                                                 .flex_wrap()
                                                 .children([
-                                                    labeled_input("Model", Input::new(&self.model_input)),
-                                                    labeled_input(
-                                                        "Thread Id",
-                                                        Input::new(&self.thread_id_input),
+                                                    auth_provider_button(
+                                                        self.app.engine_mode
+                                                            == OperatorEngineMode::CodexCli,
+                                                        "Codex CLI (Primary)",
+                                                        "engine-mode-codex-cli",
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.select_engine_mode(
+                                                                OperatorEngineMode::CodexCli,
+                                                                cx,
+                                                            );
+                                                        }),
                                                     ),
-                                                    labeled_input(
-                                                        "Thread Label",
-                                                        Input::new(&self.thread_label_input),
-                                                    ),
-                                                    labeled_input(
-                                                        "Loop Pause (s)",
-                                                        Input::new(&self.loop_pause_input),
+                                                    auth_provider_button(
+                                                        self.app.engine_mode
+                                                            == OperatorEngineMode::NativeHarness,
+                                                        "Provider Fallback",
+                                                        "engine-mode-native-harness",
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.select_engine_mode(
+                                                                OperatorEngineMode::NativeHarness,
+                                                                cx,
+                                                            );
+                                                        }),
                                                     ),
                                                 ]),
                                         )
+                                        .child(Input::new(&self.objective_input).h(px(220.0)))
                                         .child(
                                             h_flex()
                                                 .gap_2()
@@ -866,14 +897,14 @@ impl OperatorShell {
                                                         .into_any_element(),
                                                     Button::new("run-turn")
                                                         .primary()
-                                                        .label("Run Turn")
+                                                        .label("Send Prompt")
                                                         .disabled(!can_run)
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.begin_run(OperatorRunMode::SingleTurn, cx);
                                                         }))
                                                         .into_any_element(),
                                                     Button::new("start-loop")
-                                                        .label("Start Loop")
+                                                        .label("Start Autonomous Loop")
                                                         .disabled(!can_run)
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.begin_run(OperatorRunMode::Continuous, cx);
@@ -889,7 +920,7 @@ impl OperatorShell {
                                                         }))
                                                         .into_any_element(),
                                                     Button::new("start-background-loop")
-                                                        .label("Start Background Loop")
+                                                        .label("Start Background Agent")
                                                         .disabled(!can_run)
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.sync_form_into_state(cx);
@@ -916,24 +947,64 @@ impl OperatorShell {
                         )
                         .child(
                             div()
-                                .w(px(420.0))
+                                .w(px(360.0))
                                 .flex_none()
                                 .child(card(
-                                    "Engine Identity",
+                                    "Codex Connection",
                                     Some(
-                                        "This is the proof panel for what engine is actually driving the harness.",
+                                        "This is the proof pane for what engine is actually driving the session.",
                                     ),
                                     document_surface(
                                         "engine-identity",
                                         build_engine_identity_markdown(
+                                            &self.app.controller.paths,
+                                            self.app.engine_mode,
                                             self.app.auth_provider,
                                             snapshot,
                                             &self.app.settings,
                                         ),
                                         self.zoom_scale,
                                         10.0,
+                                        Some(16.0),
+                                        DocumentSurfaceMode::Scroll,
+                                        window,
+                                        cx,
+                                    ),
+                                ))
+                                .child(card(
+                                    "Harness State",
+                                    Some(
+                                        "Keep runtime readiness and model evidence visible without letting them dominate the screen.",
+                                    ),
+                                    document_surface(
+                                        "operate-harnessed-model",
+                                        build_harnessed_model_markdown(
+                                            self.app.engine_mode,
+                                            self.app.auth_provider,
+                                            snapshot,
+                                            &self.app.settings,
+                                        ),
+                                        self.zoom_scale,
+                                        10.0,
+                                        Some(16.0),
+                                        DocumentSurfaceMode::Scroll,
+                                        window,
+                                        cx,
+                                    ),
+                                ))
+                                .child(card(
+                                    "Live Status",
+                                    Some("The current runtime snapshot stays in the inspector instead of swallowing the page."),
+                                    document_surface(
+                                        "operate-live-status",
+                                        build_operate_status_markdown(
+                                            self.app.engine_mode,
+                                            snapshot,
+                                        ),
+                                        self.zoom_scale,
+                                        10.0,
                                         Some(18.0),
-                                        DocumentSurfaceMode::Fit,
+                                        DocumentSurfaceMode::Scroll,
                                         window,
                                         cx,
                                     ),
@@ -941,22 +1012,22 @@ impl OperatorShell {
                         ),
                 )
                 .child(card(
-                    "Live Status",
-                    Some("This is the operator-readable snapshot of what the runtime is doing right now."),
-                    document_surface(
-                        "operate-live-status",
-                        build_operate_status_markdown(snapshot),
-                        self.zoom_scale,
-                        10.0,
-                        None,
-                        DocumentSurfaceMode::Fit,
-                        window,
-                        cx,
-                    ),
+                    "Session Settings",
+                    Some("These controls stay available, but they should read like workspace setup rather than a dashboard form."),
+                    h_flex()
+                        .gap_3()
+                        .items_start()
+                        .flex_wrap()
+                        .children([
+                            labeled_input("Model", Input::new(&self.model_input)),
+                            labeled_input("Thread Id", Input::new(&self.thread_id_input)),
+                            labeled_input("Thread Label", Input::new(&self.thread_label_input)),
+                            labeled_input("Loop Pause (s)", Input::new(&self.loop_pause_input)),
+                        ]),
                 ))
                 .child(card(
                     "Control Follow-through",
-                    Some("Recovery and handoff actions stay close to the launch controls instead of hiding in a debug view."),
+                    Some("Recovery, handoff, and retry actions belong in the workbench, not buried in status text."),
                     v_flex()
                         .gap_3()
                         .child(provider_recovery_surface)
@@ -1064,14 +1135,14 @@ impl OperatorShell {
                 ))
                 .child(card(
                     "Runtime Paths",
-                    Some("These are the live continuity files the shell is reading and writing."),
+                    Some("Continuity files stay visible, but they no longer crowd out the session itself."),
                     document_surface(
                         "operate-runtime-paths",
                         build_paths_markdown(&self.app.controller.paths),
                         self.zoom_scale,
                         8.0,
-                        Some(18.0),
-                        DocumentSurfaceMode::Fit,
+                        Some(16.0),
+                        DocumentSurfaceMode::Scroll,
                         window,
                         cx,
                     ),
@@ -1103,8 +1174,21 @@ impl OperatorShell {
         } else {
             None
         };
-        let auth_completion_surface = if !snapshot.pending_oauth.is_empty() {
-            v_flex()
+        let auth_completion_surface = match self.app.engine_mode {
+            OperatorEngineMode::CodexCli => empty_state(
+                if snapshot.codex_cli_logged_in {
+                    "Codex CLI login is already complete"
+                } else {
+                    "Codex CLI login is browser-managed"
+                },
+                if snapshot.codex_cli_logged_in {
+                    "No callback code is needed here. The official `codex login` flow already owns authentication; once it completes in the launched terminal, this shell will detect the logged-in CLI automatically."
+                } else {
+                    "Launch `codex login` from this page. The GUI should treat the official CLI as the primary engine, so there is no callback paste box for that lane."
+                },
+                cx,
+            ),
+            OperatorEngineMode::NativeHarness if !snapshot.pending_oauth.is_empty() => v_flex()
                 .gap_3()
                 .child(empty_state(
                     "Paste callback only when OAuth is pending",
@@ -1115,9 +1199,8 @@ impl OperatorShell {
                     "Browser Callback URL Or Auth Code",
                     Input::new(&self.auth_callback_input).h(px(150.0)),
                 ))
-                .into_any_element()
-        } else {
-            empty_state(
+                .into_any_element(),
+            OperatorEngineMode::NativeHarness => empty_state(
                 if snapshot.auth_ready {
                     "Auth is already complete"
                 } else {
@@ -1129,7 +1212,7 @@ impl OperatorShell {
                     "Start a browser or device OAuth flow first. The callback/code field only appears when there is a live authorization to complete."
                 },
                 cx,
-            )
+            ),
         };
 
         page_scroll(
@@ -1144,10 +1227,40 @@ impl OperatorShell {
                                 .flex_1()
                                 .min_w_0()
                                 .child(card(
-                                    "Provider & Sign-in",
-                                    Some("Primary auth provider selected. Fallbacks stay visible but clearly secondary."),
+                                    "Engine & Sign-in",
+                                    Some("Codex CLI is the primary engine. The old native path stays available, but clearly secondary."),
                                     v_flex()
                                         .gap_3()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .children([
+                                                    auth_provider_button(
+                                                        self.app.engine_mode
+                                                            == OperatorEngineMode::CodexCli,
+                                                        "Codex CLI (Primary)",
+                                                        "auth-engine-codex-cli",
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.select_engine_mode(
+                                                                OperatorEngineMode::CodexCli,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    ),
+                                                    auth_provider_button(
+                                                        self.app.engine_mode
+                                                            == OperatorEngineMode::NativeHarness,
+                                                        "Provider Fallback",
+                                                        "auth-engine-native",
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.select_engine_mode(
+                                                                OperatorEngineMode::NativeHarness,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    ),
+                                                ]),
+                                        )
                                         .child(
                                             h_flex()
                                                 .gap_2()
@@ -1187,9 +1300,45 @@ impl OperatorShell {
                                                 .gap_2()
                                                 .flex_wrap()
                                                 .children([
+                                                    optional_button(
+                                                        Some("Refresh CLI Status".to_string()),
+                                                        !auth_busy && !background_active,
+                                                        "refresh-codex-cli-status",
+                                                        cx.listener(|this, _, _, cx| {
+                                                            let snapshot = this.snapshot();
+                                                            this.app.spawn_refresh(
+                                                                snapshot.run_state,
+                                                                parse_run_mode(snapshot.run_mode.as_str()),
+                                                                snapshot.summary,
+                                                                snapshot.last_error,
+                                                                snapshot.completed_turn_count,
+                                                                snapshot.auth_notice,
+                                                            );
+                                                            cx.notify();
+                                                        }),
+                                                    ),
+                                                    optional_button(
+                                                        (self.app.engine_mode
+                                                            == OperatorEngineMode::CodexCli)
+                                                            .then_some("Launch Codex CLI Login".to_string()),
+                                                        self.app.engine_mode == OperatorEngineMode::CodexCli
+                                                            && !auth_busy
+                                                            && !background_active
+                                                            && snapshot.codex_cli_available,
+                                                        "launch-codex-cli-login",
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.app.spawn_launch_codex_cli_login();
+                                                            cx.notify();
+                                                        }),
+                                                    ),
                                                     Button::new("auth-preflight")
                                                         .label("Auth Preflight")
-                                                        .disabled(auth_busy || background_active)
+                                                        .disabled(
+                                                            auth_busy
+                                                                || background_active
+                                                                || self.app.engine_mode
+                                                                    == OperatorEngineMode::CodexCli,
+                                                        )
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.sync_form_into_state(cx);
                                                             this.app.spawn_auth_preflight();
@@ -1208,6 +1357,8 @@ impl OperatorShell {
                                                         .disabled(
                                                             auth_busy
                                                                 || background_active
+                                                                || self.app.engine_mode
+                                                                    != OperatorEngineMode::NativeHarness
                                                                 || !oauth_launch_status.ready,
                                                         )
                                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1225,6 +1376,8 @@ impl OperatorShell {
                                                         !auth_busy
                                                             && !background_active
                                                             && oauth_launch_status.ready
+                                                            && self.app.engine_mode
+                                                                == OperatorEngineMode::NativeHarness
                                                             && self.app.auth_provider
                                                                 != OperatorAuthProvider::OpenAiCodex,
                                                         "native-device-oauth",
@@ -1242,6 +1395,8 @@ impl OperatorShell {
                                                             .then_some("Launch OpenClaw Login (Fallback)".to_string()),
                                                         self.app.auth_provider
                                                             == OperatorAuthProvider::OpenAiCodex
+                                                            && self.app.engine_mode
+                                                                == OperatorEngineMode::NativeHarness
                                                             && !auth_busy
                                                             && !background_active
                                                             && openclaw_cli
@@ -1260,6 +1415,8 @@ impl OperatorShell {
                                                             .then_some("Import OpenClaw Codex OAuth (Fallback)".to_string()),
                                                         self.app.auth_provider
                                                             == OperatorAuthProvider::OpenAiCodex
+                                                            && self.app.engine_mode
+                                                                == OperatorEngineMode::NativeHarness
                                                             && !auth_busy
                                                             && !background_active
                                                             && openclaw_status
@@ -1287,10 +1444,14 @@ impl OperatorShell {
                                     document_surface(
                                         "auth-status",
                                         build_auth_status_markdown(
+                                            self.app.engine_mode,
                                             snapshot,
                                             self.app.auth_provider,
                                             &oauth_launch_status,
                                             &operator_env_status,
+                                            snapshot.codex_cli_summary.as_str(),
+                                            snapshot.codex_cli_account_summary.as_deref(),
+                                            snapshot.codex_cli_command_path.as_deref(),
                                             openclaw_status.as_ref(),
                                             openclaw_cli.as_ref(),
                                         ),
@@ -1709,40 +1870,51 @@ impl OperatorShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        page_scroll(v_flex().gap_4().children([
-            artifact_card(
-                "Current Brief",
-                "artifacts-brief",
-                snapshot.current_brief.as_deref(),
-                self.zoom_scale,
-                window,
-                cx,
-            ),
-            artifact_card(
-                "Current Plan",
-                "artifacts-plan",
-                snapshot.current_plan.as_deref(),
-                self.zoom_scale,
-                window,
-                cx,
-            ),
-            artifact_card(
-                "Current Open Gaps",
-                "artifacts-open-gaps",
-                snapshot.current_open_gaps.as_deref(),
-                self.zoom_scale,
-                window,
-                cx,
-            ),
-            artifact_card(
-                "Current Handoff",
-                "artifacts-handoff",
-                snapshot.current_handoff.as_deref(),
-                self.zoom_scale,
-                window,
-                cx,
-            ),
-        ]))
+        page_scroll(
+            h_flex()
+                .gap_4()
+                .items_start()
+                .child(
+                    div().flex_1().min_w_0().child(v_flex().gap_4().children([
+                        artifact_card(
+                            "Current Brief",
+                            "artifacts-brief",
+                            snapshot.current_brief.as_deref(),
+                            self.zoom_scale,
+                            window,
+                            cx,
+                        ),
+                        artifact_card(
+                            "Current Plan",
+                            "artifacts-plan",
+                            snapshot.current_plan.as_deref(),
+                            self.zoom_scale,
+                            window,
+                            cx,
+                        ),
+                    ])),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(v_flex().gap_4().children([
+                        artifact_card(
+                            "Current Open Gaps",
+                            "artifacts-open-gaps",
+                            snapshot.current_open_gaps.as_deref(),
+                            self.zoom_scale,
+                            window,
+                            cx,
+                        ),
+                        artifact_card(
+                            "Current Handoff",
+                            "artifacts-handoff",
+                            snapshot.current_handoff.as_deref(),
+                            self.zoom_scale,
+                            window,
+                            cx,
+                        ),
+                    ])),
+                ),
+        )
     }
 
     fn render_activity_panel(
@@ -1752,50 +1924,73 @@ impl OperatorShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         page_scroll(
-            v_flex()
+            h_flex()
                 .gap_4()
-                .child(card(
-                    "Recent Turns",
-                    Some("This is the readable turn ledger the existing shell was missing."),
-                    document_surface(
-                        "recent-turns",
-                        bullet_markdown("Recent turns", &snapshot.recent_turns),
-                        self.zoom_scale,
-                        DOC_SURFACE_MIN_REM,
-                        Some(18.0),
-                        DocumentSurfaceMode::Fit,
-                        window,
-                        cx,
-                    ),
-                ))
-                .child(card(
-                    "Recent Session Events",
-                    Some("Events are scrollable and preserved as a real reading surface now."),
-                    document_surface(
-                        "recent-events",
-                        bullet_markdown("Recent events", &snapshot.recent_events),
-                        self.zoom_scale,
-                        DOC_SURFACE_MIN_REM,
-                        Some(18.0),
-                        DocumentSurfaceMode::Fit,
-                        window,
-                        cx,
-                    ),
-                ))
-                .child(card(
-                    "Runtime Status Details",
-                    Some("This is the operator-readable status snapshot for deeper inspection."),
-                    document_surface(
-                        "runtime-status-details",
-                        build_activity_markdown(snapshot),
-                        self.zoom_scale,
-                        10.0,
-                        Some(18.0),
-                        DocumentSurfaceMode::Fit,
-                        window,
-                        cx,
-                    ),
-                )),
+                .items_start()
+                .child(
+                    div().flex_1().min_w_0().child(v_flex().gap_4().children([
+                        card(
+                            "Recent Codex Replies",
+                            Some("Every recent provider reply should be visible here in full, not collapsed into empty-looking bullets."),
+                            document_surface(
+                                "recent-turn-replies",
+                                build_recent_replies_markdown(self.app.engine_mode, snapshot),
+                                self.zoom_scale,
+                                18.0,
+                                Some(24.0),
+                                DocumentSurfaceMode::Scroll,
+                                window,
+                                cx,
+                            ),
+                        ),
+                        card(
+                            "Recent Turns",
+                            Some("This is the readable turn ledger the existing shell was missing."),
+                            document_surface(
+                                "recent-turns",
+                                build_recent_turns_markdown(self.app.engine_mode, snapshot),
+                                self.zoom_scale,
+                                DOC_SURFACE_MIN_REM,
+                                Some(22.0),
+                                DocumentSurfaceMode::Scroll,
+                                window,
+                                cx,
+                            ),
+                        ),
+                    ])),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(v_flex().gap_4().children([
+                        card(
+                            "Recent Session Events",
+                            Some("Events are preserved as a readable lane instead of a dead status slab."),
+                            document_surface(
+                                "recent-events",
+                                build_recent_events_markdown(self.app.engine_mode, snapshot),
+                                self.zoom_scale,
+                                DOC_SURFACE_MIN_REM,
+                                Some(22.0),
+                                DocumentSurfaceMode::Scroll,
+                                window,
+                                cx,
+                            ),
+                        ),
+                        card(
+                            "Runtime Status Details",
+                            Some("This is the operator-readable status snapshot for deeper inspection."),
+                            document_surface(
+                                "runtime-status-details",
+                                build_activity_markdown(snapshot),
+                                self.zoom_scale,
+                                10.0,
+                                Some(22.0),
+                                DocumentSurfaceMode::Scroll,
+                                window,
+                                cx,
+                            ),
+                        ),
+                    ])),
+                ),
         )
     }
 }
@@ -1829,8 +2024,8 @@ impl Render for OperatorShell {
                                     div()
                                         .w_full()
                                         .min_w_0()
-                                        .max_w(px(1540.0))
-                                        .px_8()
+                                        .max_w(px(1880.0))
+                                        .px_6()
                                         .py_6()
                                         .child(
                                             v_flex()
@@ -1886,16 +2081,25 @@ fn card(
         }
     };
     v_flex()
-        .gap_3()
+        .gap_0()
         .w_full()
-        .p_4()
+        .overflow_hidden()
         .rounded_lg()
         .border_1()
         .border_color(shell_border())
         .bg(shell_panel())
         .shadow_sm()
-        .child(header)
-        .child(body)
+        .child(
+            div()
+                .w_full()
+                .px_4()
+                .py_3()
+                .border_b_1()
+                .border_color(shell_border())
+                .bg(shell_panel_elevated())
+                .child(header),
+        )
+        .child(div().w_full().p_4().child(body))
 }
 
 fn labeled_input(label: &str, input: impl IntoElement) -> AnyElement {
@@ -1946,9 +2150,11 @@ fn document_surface(
     window: &mut Window,
     cx: &mut Context<OperatorShell>,
 ) -> AnyElement {
-    let _ = (id.into(), zoom_scale, window, cx, mode);
+    let id: SharedString = id.into();
+    let _ = (zoom_scale, window, cx, mode);
     let body: SharedString = body.into();
-    let mut container = div()
+    let copy_body = body.to_string();
+    let container = div()
         .w_full()
         .min_w_0()
         .min_h(rems(min_height_rem))
@@ -1959,20 +2165,44 @@ fn document_surface(
         .p_3()
         .overflow_hidden();
 
-    if matches!(mode, DocumentSurfaceMode::Fit) {
-        let _ = max_height_rem;
-    } else if let Some(max_height_rem) = max_height_rem {
-        container = container.max_h(rems(max_height_rem));
-    }
-
     let body = v_flex()
         .w_full()
         .min_w_0()
-        .gap_1()
-        .children(body.lines().map(render_document_line))
+        .gap_2()
+        .child(
+            h_flex().w_full().justify_end().child(
+                Button::new(SharedString::from(format!("{id}-copy")))
+                    .label("Copy")
+                    .ghost()
+                    .compact()
+                    .disabled(copy_body.trim().is_empty())
+                    .on_click(move |_, _, app| {
+                        app.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
+                    }),
+            ),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .children(body.lines().map(render_document_line)),
+        )
         .into_any_element();
 
-    container.child(body).into_any_element()
+    let content = match mode {
+        DocumentSurfaceMode::Fit => div().w_full().min_w_0().child(body).into_any_element(),
+        DocumentSurfaceMode::Scroll => div()
+            .w_full()
+            .min_w_0()
+            .min_h_0()
+            .max_h(rems(max_height_rem.unwrap_or(min_height_rem + 8.0)))
+            .overflow_y_scrollbar()
+            .child(body)
+            .into_any_element(),
+    };
+
+    container.child(content).into_any_element()
 }
 
 fn optional_button(
@@ -2056,14 +2286,14 @@ fn artifact_card(
     let body = body.unwrap_or("Not available yet.").to_string();
     card(
         title,
-        Some("Full document view with selection and page scrolling."),
+        Some("Full document view in a bounded reading pane."),
         document_surface(
             SharedString::from(id.to_string()),
             body,
             zoom_scale,
             DOC_SURFACE_MIN_REM,
-            None,
-            DocumentSurfaceMode::Fit,
+            Some(24.0),
+            DocumentSurfaceMode::Scroll,
             window,
             cx,
         ),
@@ -2072,64 +2302,170 @@ fn artifact_card(
 }
 
 fn build_engine_identity_markdown(
+    paths: &OperatorPaths,
+    engine_mode: OperatorEngineMode,
     provider: OperatorAuthProvider,
     snapshot: &OperatorSnapshot,
     settings: &RunSettings,
 ) -> String {
-    let endpoint = "https://api.openai.com/v1/responses";
-    let pending_turn = effective_pending_phase_label(snapshot);
-    let last_completed_round = snapshot
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| event.contains("TurnRoundCompleted"))
-        .cloned()
-        .unwrap_or_else(|| "No completed provider round recorded yet.".to_string());
-    format!(
-        "# AGRO Connection Proof\n\n- **Provider:** {}\n- **Endpoint:** `{endpoint}`\n- **Model:** `{}`\n- **Thread:** `{}` ({})\n- **Pending turn phase:** `{pending_turn}`\n- **Foreground runtime:** `{}`\n- **Background runner:** `{}`\n- **Auth evidence:** {}\n- **Latest completed provider round:** {}\n\n> This operator frontend authenticates to the selected provider and manages the AGRO workflow.",
-        provider.as_label(),
-        settings.model,
-        settings.thread_id,
-        settings.thread_label,
-        snapshot.run_mode,
-        snapshot
-            .background_runner_status
-            .as_deref()
-            .unwrap_or("none"),
-        snapshot.auth_summary,
-        last_completed_round,
-    )
+    match engine_mode {
+        OperatorEngineMode::CodexCli => {
+            let last_completed_round = snapshot
+                .codex_cli_recent_events
+                .iter()
+                .rev()
+                .find(|event| event.contains("turn.completed"))
+                .cloned()
+                .or_else(|| snapshot.codex_cli_last_turn_summary.clone())
+                .unwrap_or_else(|| "No completed Codex CLI turn recorded yet.".to_string());
+            let session_turn_log = paths
+                .session_root
+                .join(&paths.session_id)
+                .join("codex-cli-turn-log.jsonl");
+            let recent_events = snapshot
+                .codex_cli_recent_events
+                .iter()
+                .rev()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>();
+            let recent_events_block = if recent_events.is_empty() {
+                "- no CLI session events recorded yet".to_string()
+            } else {
+                recent_events
+                    .into_iter()
+                    .rev()
+                    .map(|event| format!("- {event}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "# Codex CLI Connection Proof\n\n- **Engine mode:** {CLI_CODEX_ENGINE_LABEL}\n- **Summary:** {CLI_CODEX_ENGINE_SUMMARY}\n- **CLI availability:** {}\n- **CLI login:** {}\n- **CLI status:** {}\n- **Command path:** `{}`\n- **CLI account evidence:** {}\n- **Session id:** `{}`\n- **Session artifact:** `{}`\n- **Turn log artifact:** `{}`\n- **Operator status artifact:** `{}`\n- **Model:** `{}`\n- **Thread:** `{}` ({})\n- **Foreground runtime:** `{}`\n- **Background runner:** `{}`\n- **Latest completed CLI turn:** {}\n\n## Latest CLI Event Evidence\n{}\n\n> This proof is artifact-backed. The GUI is reading a real Codex CLI session file plus a real CLI turn log between turns.",
+                if snapshot.codex_cli_available {
+                    "available"
+                } else {
+                    "missing"
+                },
+                if snapshot.codex_cli_logged_in {
+                    "ready"
+                } else {
+                    "not logged in"
+                },
+                snapshot.codex_cli_summary,
+                snapshot
+                    .codex_cli_command_path
+                    .as_deref()
+                    .unwrap_or("not recorded"),
+                snapshot
+                    .codex_cli_account_summary
+                    .as_deref()
+                    .unwrap_or("not recorded"),
+                snapshot
+                    .codex_cli_session_id
+                    .as_deref()
+                    .unwrap_or("not recorded"),
+                paths.codex_cli_session_path.display(),
+                session_turn_log.display(),
+                paths.status_path.display(),
+                settings.model,
+                settings.thread_id,
+                settings.thread_label,
+                snapshot.run_mode,
+                snapshot
+                    .background_runner_status
+                    .as_deref()
+                    .unwrap_or("none"),
+                last_completed_round,
+                recent_events_block,
+            )
+        }
+        OperatorEngineMode::NativeHarness => {
+            let pending_turn = effective_pending_phase_label(snapshot);
+            let last_completed_round = snapshot
+                .recent_events
+                .iter()
+                .rev()
+                .find(|event| event.contains("TurnRoundCompleted"))
+                .cloned()
+                .unwrap_or_else(|| "No completed provider round recorded yet.".to_string());
+            format!(
+                "# Provider Fallback Proof\n\n- **Engine mode:** {FALLBACK_PROVIDER_LABEL}\n- **Summary:** {FALLBACK_PROVIDER_SUMMARY}\n- **Provider:** {}\n- **Model:** `{}`\n- **Thread:** `{}` ({})\n- **Pending turn phase:** `{pending_turn}`\n- **Foreground runtime:** `{}`\n- **Background runner:** `{}`\n- **Auth evidence:** {}\n- **Latest completed provider round:** {}\n\n> This lane is not the product center. It exists as a fallback while the primary Codex CLI session remains the operator default.",
+                provider.as_label(),
+                settings.model,
+                settings.thread_id,
+                settings.thread_label,
+                snapshot.run_mode,
+                snapshot
+                    .background_runner_status
+                    .as_deref()
+                    .unwrap_or("none"),
+                snapshot.auth_summary,
+                last_completed_round,
+            )
+        }
+    }
 }
 
 fn build_harnessed_model_markdown(
+    engine_mode: OperatorEngineMode,
     provider: OperatorAuthProvider,
     snapshot: &OperatorSnapshot,
     settings: &RunSettings,
 ) -> String {
     let mut lines = vec![
-        format!("- **Provider:** {}", provider.as_label()),
+        format!("- **Engine:** {}", engine_mode.as_label()),
         format!("- **Model:** `{}`", settings.model),
         format!(
             "- **Thread:** `{}` ({})",
             settings.thread_id, settings.thread_label
         ),
-        format!(
-            "- **Auth state:** {}",
-            if snapshot.auth_ready {
-                "ready"
-            } else {
-                "blocked"
-            }
-        ),
         format!("- **Run state:** {}", snapshot.run_state),
         format!("- **Run mode:** {}", snapshot.run_mode),
-        format!(
-            "- **Pending phase:** {}",
-            effective_pending_phase_label(snapshot)
-        ),
     ];
-    if let Some(last_turn) = snapshot.last_turn_summary.as_deref() {
-        lines.push(format!("- **Latest bounded outcome:** {last_turn}"));
+    match engine_mode {
+        OperatorEngineMode::CodexCli => {
+            lines.push(format!(
+                "- **CLI readiness:** {}",
+                if snapshot.codex_cli_available && snapshot.codex_cli_logged_in {
+                    "ready"
+                } else if snapshot.codex_cli_available {
+                    "login required"
+                } else {
+                    "missing cli"
+                }
+            ));
+            lines.push(format!("- **CLI status:** {}", snapshot.codex_cli_summary));
+            if let Some(session_id) = snapshot.codex_cli_session_id.as_deref() {
+                lines.push(format!("- **CLI session id:** `{session_id}`"));
+            }
+            if let Some(last_turn) = snapshot.codex_cli_last_turn_summary.as_deref() {
+                lines.push(format!("- **Latest CLI outcome:** {last_turn}"));
+            }
+            if let Some(last_reply) = snapshot.codex_cli_last_turn_reply.as_deref() {
+                lines.push(format!(
+                    "- **Latest reply preview:** {}",
+                    truncate_text(last_reply, 220)
+                ));
+            }
+        }
+        OperatorEngineMode::NativeHarness => {
+            lines.push(format!("- **Provider:** {}", provider.as_label()));
+            lines.push(format!(
+                "- **Auth state:** {}",
+                if snapshot.auth_ready {
+                    "ready"
+                } else {
+                    "blocked"
+                }
+            ));
+            lines.push(format!(
+                "- **Pending phase:** {}",
+                effective_pending_phase_label(snapshot)
+            ));
+            if let Some(last_turn) = snapshot.last_turn_summary.as_deref() {
+                lines.push(format!("- **Latest bounded outcome:** {last_turn}"));
+            }
+        }
     }
     if let Some(background_summary) = snapshot.background_runner_summary.as_deref() {
         lines.push(format!(
@@ -2151,36 +2487,75 @@ fn build_harnessed_model_markdown(
     format!("# Harnessed Model\n\n{}", lines.join("\n"))
 }
 
-fn build_operate_status_markdown(snapshot: &OperatorSnapshot) -> String {
+fn build_operate_status_markdown(
+    engine_mode: OperatorEngineMode,
+    snapshot: &OperatorSnapshot,
+) -> String {
     let mut lines = vec![
         format!("- **Summary:** {}", snapshot.summary),
-        format!("- **Auth readiness:** {}", snapshot.auth_readiness),
         format!("- **Completed turns:** {}", snapshot.completed_turn_count),
     ];
-    if provider_retry_needed(snapshot) {
-        lines.push(
-            "- **Provider state:** The last bounded attempt failed after auth. This is not waiting on OAuth or a callback code.".to_string(),
-        );
-        lines.push(
-            "- **Next step:** Use **Run Turn** to retry the bounded step, or **Auth Preflight** to re-check the provider session before retrying.".to_string(),
-        );
-    }
-    if let Some(last_turn) = snapshot.last_turn_summary.as_deref() {
-        lines.push(format!("- **Last turn:** {last_turn}"));
+    match engine_mode {
+        OperatorEngineMode::CodexCli => {
+            lines.push(format!(
+                "- **CLI readiness:** {}",
+                if snapshot.codex_cli_available && snapshot.codex_cli_logged_in {
+                    "ready"
+                } else if snapshot.codex_cli_available {
+                    "login required"
+                } else {
+                    "missing cli"
+                }
+            ));
+            lines.push(format!("- **CLI status:** {}", snapshot.codex_cli_summary));
+            if let Some(last_turn) = snapshot.codex_cli_last_turn_summary.as_deref() {
+                lines.push(format!("- **Last CLI turn:** {last_turn}"));
+            }
+            if let Some(session_id) = snapshot.codex_cli_session_id.as_deref() {
+                lines.push(format!("- **Session:** `{session_id}`"));
+            }
+            if !snapshot.codex_cli_logged_in {
+                lines.push(
+                    "- **Next step:** Use **Launch Codex CLI Login** on the Auth page, complete the official CLI sign-in, then refresh this shell.".to_string(),
+                );
+            } else {
+                lines.push(
+                    "- **Next step:** Send a prompt or start the autonomous loop. The GUI will drive `codex exec` or `codex exec resume` instead of the old native client path.".to_string(),
+                );
+            }
+        }
+        OperatorEngineMode::NativeHarness => {
+            lines.push(format!("- **Auth readiness:** {}", snapshot.auth_readiness));
+            if provider_retry_needed(snapshot) {
+                lines.push(
+                    "- **Provider state:** The last bounded attempt failed after auth. This is not waiting on OAuth or a callback code.".to_string(),
+                );
+                lines.push(
+                    "- **Next step:** Use **Send Prompt** to retry the bounded step, or **Auth Preflight** to re-check the provider session before retrying.".to_string(),
+                );
+            }
+            if let Some(last_turn) = snapshot.last_turn_summary.as_deref() {
+                lines.push(format!("- **Last turn:** {last_turn}"));
+            }
+            if let Some(phase) = snapshot.pending_turn_phase.as_deref() {
+                lines.push(format!(
+                    "- **Pending phase:** {}",
+                    effective_pending_phase_label(snapshot)
+                ));
+                if phase == "AwaitingProvider"
+                    && snapshot.auth_ready
+                    && !provider_retry_needed(snapshot)
+                {
+                    lines.push(
+                        "- **Meaning:** OAuth is already complete. The runtime is waiting on the next provider/model step."
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
     if let Some(last_error) = snapshot.last_error.as_deref() {
         lines.push(format!("- **Last error:** {last_error}"));
-    }
-    if let Some(phase) = snapshot.pending_turn_phase.as_deref() {
-        lines.push(format!(
-            "- **Pending phase:** {}",
-            effective_pending_phase_label(snapshot)
-        ));
-        if phase == "AwaitingProvider" && snapshot.auth_ready && !provider_retry_needed(snapshot) {
-            lines.push(
-                "- **Meaning:** OAuth is already complete. The runtime is waiting on the next provider/model step.".to_string(),
-            );
-        }
     }
     if let Some(action) = snapshot.pending_turn_action.as_deref() {
         lines.push(format!("- **Pending action:** {action}"));
@@ -2220,7 +2595,7 @@ fn effective_pending_phase_label(snapshot: &OperatorSnapshot) -> String {
 
 fn build_paths_markdown(paths: &OperatorPaths) -> String {
     format!(
-        "# Operator Paths\n\n- **Repo root:** `{}`\n- **Harness root:** `{}`\n- **Operator root:** `{}`\n- **Status:** `{}`\n- **Session root:** `{}`\n- **State DB:** `{}`\n- **Auth store:** `{}`\n- **Operator env:** `{}`",
+        "# Operator Paths\n\n- **Repo root:** `{}`\n- **Harness root:** `{}`\n- **Operator root:** `{}`\n- **Status:** `{}`\n- **Session root:** `{}`\n- **State DB:** `{}`\n- **Auth store:** `{}`\n- **CLI session:** `{}`\n- **Operator env:** `{}`",
         paths.repo_root.display(),
         paths.harness_root.display(),
         paths.operator_root.display(),
@@ -2228,46 +2603,100 @@ fn build_paths_markdown(paths: &OperatorPaths) -> String {
         paths.session_root.display(),
         paths.state_db_path.display(),
         paths.auth_store_path.display(),
+        paths.codex_cli_session_path.display(),
         paths.operator_env_path.display()
     )
 }
 
 fn build_auth_status_markdown(
+    engine_mode: OperatorEngineMode,
     snapshot: &OperatorSnapshot,
     provider: OperatorAuthProvider,
     oauth_status: &InteractiveOAuthLaunchStatus,
     env_status: &OperatorEnvConfigStatus,
+    codex_cli_summary: &str,
+    codex_cli_account_summary: Option<&str>,
+    codex_cli_command_path: Option<&str>,
     openclaw_status: Option<&OpenClawImportStatus>,
     openclaw_cli: Option<&OpenClawCliStatus>,
 ) -> String {
-    let mut lines = vec![
-        format!("- **Provider:** {}", provider.as_label()),
-        format!("- **Readiness:** {}", snapshot.auth_readiness),
-        format!("- **Summary:** {}", snapshot.auth_summary),
-        format!("- **Interactive OAuth:** {}", oauth_status.summary),
-        format!("- **Operator env:** {}", env_status.summary),
-    ];
-    if snapshot.pending_oauth.is_empty() && snapshot.auth_ready {
-        lines.push("- **Callback state:** No callback input is needed right now because auth is already complete.".to_string());
-    } else if snapshot.pending_oauth.is_empty() {
-        lines.push("- **Callback state:** No OAuth authorization is pending yet. Start a browser or device flow before trying to complete one.".to_string());
+    match engine_mode {
+        OperatorEngineMode::CodexCli => {
+            let mut lines = vec![
+                format!(
+                    "- **CLI readiness:** {}",
+                    if snapshot.codex_cli_logged_in {
+                        "ready"
+                    } else if snapshot.codex_cli_available {
+                        "login required"
+                    } else {
+                        "missing cli"
+                    }
+                ),
+                format!("- **CLI summary:** {codex_cli_summary}"),
+                format!(
+                    "- **Command path:** `{}`",
+                    codex_cli_command_path.unwrap_or("not recorded")
+                ),
+            ];
+            if let Some(account_summary) = codex_cli_account_summary {
+                lines.push(format!("- **CLI account:** {account_summary}"));
+            }
+            if let Some(session_id) = snapshot.codex_cli_session_id.as_deref() {
+                lines.push(format!("- **Recorded session:** `{session_id}`"));
+            }
+            lines.push(
+                "- **Callback state:** No callback paste is needed for the primary CLI lane. The official `codex login` flow owns authentication in its own terminal."
+                    .to_string(),
+            );
+            if let Some(auth_notice) = snapshot.auth_notice.as_deref() {
+                lines.push(format!("- **Latest shell notice:** {auth_notice}"));
+            }
+            if let Some(openclaw_cli) = openclaw_cli {
+                lines.push(format!(
+                    "- **OpenClaw fallback availability:** {}",
+                    openclaw_cli.summary
+                ));
+            }
+            if let Some(openclaw_status) = openclaw_status {
+                lines.push(format!(
+                    "- **OpenClaw import fallback:** {}",
+                    openclaw_status.summary
+                ));
+            }
+            format!("# Auth Status\n\n{}", lines.join("\n"))
+        }
+        OperatorEngineMode::NativeHarness => {
+            let mut lines = vec![
+                format!("- **Provider:** {}", provider.as_label()),
+                format!("- **Readiness:** {}", snapshot.auth_readiness),
+                format!("- **Summary:** {}", snapshot.auth_summary),
+                format!("- **Interactive OAuth:** {}", oauth_status.summary),
+                format!("- **Operator env:** {}", env_status.summary),
+            ];
+            if snapshot.pending_oauth.is_empty() && snapshot.auth_ready {
+                lines.push("- **Callback state:** No callback input is needed right now because auth is already complete.".to_string());
+            } else if snapshot.pending_oauth.is_empty() {
+                lines.push("- **Callback state:** No OAuth authorization is pending yet. Start a browser or device flow before trying to complete one.".to_string());
+            }
+            if let Some(auth_notice) = snapshot.auth_notice.as_deref() {
+                lines.push(format!("- **Latest auth notice:** {auth_notice}"));
+            }
+            if let Some(openclaw_status) = openclaw_status {
+                lines.push(format!(
+                    "- **OpenClaw import fallback:** {}",
+                    openclaw_status.summary
+                ));
+            }
+            if let Some(openclaw_cli) = openclaw_cli {
+                lines.push(format!(
+                    "- **OpenClaw CLI fallback:** {}",
+                    openclaw_cli.summary
+                ));
+            }
+            format!("# Auth Status\n\n{}", lines.join("\n"))
+        }
     }
-    if let Some(auth_notice) = snapshot.auth_notice.as_deref() {
-        lines.push(format!("- **Latest auth notice:** {auth_notice}"));
-    }
-    if let Some(openclaw_status) = openclaw_status {
-        lines.push(format!(
-            "- **OpenClaw import fallback:** {}",
-            openclaw_status.summary
-        ));
-    }
-    if let Some(openclaw_cli) = openclaw_cli {
-        lines.push(format!(
-            "- **OpenClaw CLI fallback:** {}",
-            openclaw_cli.summary
-        ));
-    }
-    format!("# Auth Status\n\n{}", lines.join("\n"))
 }
 
 fn build_pending_oauth_markdown(pending: &OperatorPendingOAuthView) -> String {
@@ -2514,6 +2943,91 @@ fn build_activity_markdown(snapshot: &OperatorSnapshot) -> String {
     format!("# Runtime Details\n\n{}", lines.join("\n"))
 }
 
+fn build_conversation_markdown(
+    engine_mode: OperatorEngineMode,
+    snapshot: &OperatorSnapshot,
+    prompt_draft: &str,
+) -> String {
+    let mut sections = vec!["# Conversation".to_string()];
+
+    if !prompt_draft.trim().is_empty() {
+        sections.push(format!("## You\n\n{}", prompt_draft.trim()));
+    }
+
+    let replies = match engine_mode {
+        OperatorEngineMode::CodexCli => &snapshot.codex_cli_recent_turn_replies,
+        OperatorEngineMode::NativeHarness => &snapshot.recent_turn_replies,
+    };
+
+    if replies.is_empty() {
+        sections.push(
+            "## Codex\n\nNo provider reply has been recorded yet. Send a prompt to start the session."
+                .to_string(),
+        );
+    } else {
+        for reply in replies.iter().rev() {
+            sections.push(reply.clone());
+        }
+    }
+
+    sections.join("\n\n")
+}
+
+fn build_recent_replies_markdown(
+    engine_mode: OperatorEngineMode,
+    snapshot: &OperatorSnapshot,
+) -> String {
+    let replies = match engine_mode {
+        OperatorEngineMode::CodexCli => &snapshot.codex_cli_recent_turn_replies,
+        OperatorEngineMode::NativeHarness => &snapshot.recent_turn_replies,
+    };
+    if replies.is_empty() {
+        "# Recent Codex Replies\n\nNo provider replies have been recorded yet.".to_string()
+    } else {
+        replies.join("\n\n")
+    }
+}
+
+fn build_recent_turns_markdown(
+    engine_mode: OperatorEngineMode,
+    snapshot: &OperatorSnapshot,
+) -> String {
+    let turns = match engine_mode {
+        OperatorEngineMode::CodexCli => snapshot
+            .codex_cli_recent_turn_replies
+            .iter()
+            .map(|reply| truncate_text(reply, 220))
+            .collect::<Vec<_>>(),
+        OperatorEngineMode::NativeHarness => snapshot.recent_turns.clone(),
+    };
+    bullet_markdown("Recent turns", &turns)
+}
+
+fn build_recent_events_markdown(
+    engine_mode: OperatorEngineMode,
+    snapshot: &OperatorSnapshot,
+) -> String {
+    let events = match engine_mode {
+        OperatorEngineMode::CodexCli => &snapshot.codex_cli_recent_events,
+        OperatorEngineMode::NativeHarness => &snapshot.recent_events,
+    };
+    bullet_markdown("Recent events", events)
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "Not available yet.".to_string();
+    }
+    let mut chars = trimmed.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn bullet_markdown(title: &str, lines: &[String]) -> String {
     if lines.is_empty() {
         format!("# {title}\n\n- Not available yet.")
@@ -2528,3 +3042,4 @@ fn bullet_markdown(title: &str, lines: &[String]) -> String {
         )
     }
 }
+
