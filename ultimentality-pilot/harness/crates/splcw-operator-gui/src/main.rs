@@ -177,6 +177,7 @@ fn default_native_engine_mode() -> OperatorEngineMode {
 #[derive(Debug, Clone, Default)]
 struct OperatorCommand {
     smoke_test: bool,
+    run_turn: bool,
     background_loop: bool,
     settings: RunSettings,
     loop_pause_seconds: f32,
@@ -1264,7 +1265,7 @@ impl HarnessController {
             build_codex_cli_context_prompt(&self.paths, settings.objective.as_str(), grounding_bundle.as_deref());
         let previous_session =
             read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
-        let mut args = if let Some(previous_session) = previous_session.as_ref() {
+        let args = if let Some(previous_session) = previous_session.as_ref() {
             vec![
                 "exec".to_string(),
                 "resume".to_string(),
@@ -1272,6 +1273,7 @@ impl HarnessController {
                 "-m".to_string(),
                 normalize_text(&settings.model, DEFAULT_MODEL),
                 previous_session.session_id.clone(),
+                "-".to_string(),
             ]
         } else {
             vec![
@@ -1283,10 +1285,15 @@ impl HarnessController {
                 normalize_text(&settings.model, DEFAULT_MODEL),
                 "-C".to_string(),
                 self.paths.repo_root.display().to_string(),
+                "-".to_string(),
             ]
         };
-        args.push(prompt);
-        let output = run_command_capture(command_path, &self.paths.repo_root, &args)?;
+        let output = run_command_capture_with_stdin(
+            command_path,
+            &self.paths.repo_root,
+            &args,
+            prompt.as_bytes(),
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let parsed = parse_codex_cli_exec_output(&stdout, &stderr);
@@ -5329,6 +5336,16 @@ fn build_output_command(command_path: &Path, cwd: &Path, args: &[String]) -> Com
             .extension()
             .and_then(|value| value.to_str())
             .map(|value| value.to_ascii_lowercase());
+        if let Some((program, bootstrap_args)) = windows_codex_npm_shim_command(command_path) {
+            let mut command = Command::new(program);
+            command.args(bootstrap_args);
+            command.args(args);
+            command.current_dir(cwd);
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            return command;
+        }
         if matches!(extension.as_deref(), Some("cmd" | "bat")) {
             let mut command = Command::new("cmd.exe");
             command.arg("/d").arg("/c").arg(command_path);
@@ -5348,6 +5365,40 @@ fn build_output_command(command_path: &Path, cwd: &Path, args: &[String]) -> Com
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_npm_shim_command(command_path: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let file_stem = command_path
+        .file_stem()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    if file_stem != "codex" {
+        return None;
+    }
+    let extension = command_path
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "cmd" | "bat") {
+        return None;
+    }
+    let shim_dir = command_path.parent()?;
+    let script_path = shim_dir
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("bin")
+        .join("codex.js");
+    if !script_path.exists() {
+        return None;
+    }
+    let node_path = if shim_dir.join("node.exe").exists() {
+        shim_dir.join("node.exe")
+    } else {
+        PathBuf::from("node")
+    };
+    Some((node_path, vec![script_path.display().to_string()]))
 }
 
 fn run_command_checked(command_path: &Path, cwd: &Path, args: &[String]) -> anyhow::Result<String> {
@@ -5383,13 +5434,15 @@ fn run_command_checked(command_path: &Path, cwd: &Path, args: &[String]) -> anyh
     ))
 }
 
-fn run_command_capture(
+fn run_command_capture_with_stdin(
     command_path: &Path,
     cwd: &Path,
     args: &[String],
+    stdin_bytes: &[u8],
 ) -> anyhow::Result<std::process::Output> {
-    build_output_command(command_path, cwd, args)
-        .output()
+    let mut child = build_output_command(command_path, cwd, args)
+        .stdin(Stdio::piped())
+        .spawn()
         .with_context(|| {
             format!(
                 "run {} {} in {}",
@@ -5397,7 +5450,22 @@ fn run_command_capture(
                 args.join(" "),
                 cwd.display()
             )
-        })
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_bytes)
+            .with_context(|| format!("write stdin for {}", command_path.display()))?;
+    }
+
+    child.wait_with_output().with_context(|| {
+        format!(
+            "wait for {} {} in {}",
+            command_path.display(),
+            args.join(" "),
+            cwd.display()
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -7321,6 +7389,7 @@ fn parse_operator_command() -> anyhow::Result<OperatorCommand> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--smoke-test" => command.smoke_test = true,
+            "--run-turn" => command.run_turn = true,
             "--background-loop" => command.background_loop = true,
             "--background-runner-id" => {
                 command.background_runner_id =
@@ -7871,6 +7940,84 @@ fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
+    if command.run_turn {
+        let settings = command.settings.clone();
+        let snapshot = run_async({
+            let controller = app_controller.clone();
+            move || async move {
+                match controller.run_turn(&settings).await {
+                    Ok(outcome) => {
+                        controller
+                            .read_snapshot(
+                                "idle",
+                                OperatorRunMode::SingleTurn,
+                                &outcome.summary,
+                                None,
+                                0,
+                                None,
+                            )
+                            .await
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let snapshot = controller
+                            .read_snapshot(
+                                "error",
+                                OperatorRunMode::SingleTurn,
+                                "run-turn failed",
+                                Some(message.clone()),
+                                0,
+                                None,
+                            )
+                            .await?;
+                        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                        Err(anyhow!(message))
+                    }
+                }
+            }
+        })?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
+    if command.run_turn {
+        let settings = command.settings.clone();
+        let snapshot = run_async({
+            let controller = app_controller.clone();
+            move || async move {
+                match controller.run_turn(&settings).await {
+                    Ok(outcome) => {
+                        controller
+                            .read_snapshot(
+                                "idle",
+                                OperatorRunMode::SingleTurn,
+                                &outcome.summary,
+                                None,
+                                0,
+                                None,
+                            )
+                            .await
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let snapshot = controller
+                            .read_snapshot(
+                                "error",
+                                OperatorRunMode::SingleTurn,
+                                "run-turn failed",
+                                Some(message.clone()),
+                                0,
+                                None,
+                            )
+                            .await?;
+                        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                        Err(anyhow!(message))
+                    }
+                }
+            }
+        })?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
     if command.background_loop {
         run_async({
             let controller = app_controller.clone();
@@ -7914,7 +8061,8 @@ fn main() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let command = parse_operator_command()?;
-    let app_controller = Arc::new(HarnessController::new(OperatorPaths::discover()?)?);
+    let paths = OperatorPaths::discover()?;
+    let app_controller = Arc::new(HarnessController::new(paths)?);
     if command.smoke_test {
         let snapshot = run_async({
             let controller = app_controller.clone();
@@ -7922,6 +8070,45 @@ fn main() -> anyhow::Result<()> {
                 controller
                     .read_snapshot("idle", OperatorRunMode::Idle, "smoke-test", None, 0, None)
                     .await
+            }
+        })?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
+    if command.run_turn {
+        let settings = command.settings.clone();
+        let snapshot = run_async({
+            let controller = app_controller.clone();
+            move || async move {
+                match controller.run_turn(&settings).await {
+                    Ok(outcome) => {
+                        controller
+                            .read_snapshot(
+                                "idle",
+                                OperatorRunMode::SingleTurn,
+                                &outcome.summary,
+                                None,
+                                0,
+                                None,
+                            )
+                            .await
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let snapshot = controller
+                            .read_snapshot(
+                                "error",
+                                OperatorRunMode::SingleTurn,
+                                "run-turn failed",
+                                Some(message.clone()),
+                                0,
+                                None,
+                            )
+                            .await?;
+                        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                        Err(anyhow!(message))
+                    }
+                }
             }
         })?;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -8005,7 +8192,7 @@ mod tests {
         reconcile_crashed_background_runner, recoverable_background_settings,
         request_target_matches_callback_path, resolve_interactive_oauth_client_id_with, run_async,
         should_continue_run_loop, sleep_while_background_running, summarize_github_action_result,
-        write_json_atomic,
+        windows_codex_npm_shim_command, write_json_atomic,
     };
     use anyhow::Context;
     use chrono::{Duration, Utc};
@@ -9566,6 +9753,29 @@ mod tests {
         );
 
         assert_eq!(resolved, Some(codex));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_codex_npm_shim_command_prefers_js_entrypoint() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let npm_dir = root.path().join("npm");
+        let script_dir = npm_dir
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin");
+        std::fs::create_dir_all(&script_dir)?;
+        let codex = npm_dir.join("codex.cmd");
+        let script = script_dir.join("codex.js");
+        std::fs::write(&codex, "@echo off\r\n")?;
+        std::fs::write(&script, "console.log('codex')\n")?;
+
+        let (program, bootstrap_args) = windows_codex_npm_shim_command(&codex)
+            .context("expected npm shim bypass")?;
+
+        assert_eq!(program, PathBuf::from("node"));
+        assert_eq!(bootstrap_args, vec![script.display().to_string()]);
         Ok(())
     }
 

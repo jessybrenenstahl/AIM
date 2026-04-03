@@ -21,6 +21,12 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - `cargo check -p splcw-operator-gui`
   - `cargo test -p splcw-operator-gui` (`110` passing)
   - packaged smoke test from `artifacts/ultimentality-pilot/operator/dist/AGRO Harness Operator.exe`
+- grounded Codex CLI turns now complete successfully from both:
+  - `ultimentality-pilot/harness/target/debug/splcw-operator-gui.exe --run-turn --engine-mode codex_cli ...`
+  - `artifacts/ultimentality-pilot/operator/dist/AGRO Harness Operator.exe --run-turn --engine-mode codex_cli ...`
+- the live CLI reply now proves the operating-memory bundle is being used and is persisted into:
+  - `artifacts/ultimentality-pilot/operator/codex-cli-session.json`
+  - `artifacts/ultimentality-pilot/operator/sessions/operator-main/codex-cli-turn-log.jsonl`
 - top-level operator readiness now correctly treats a logged-in Codex CLI as ready even when no legacy fallback auth profile exists
 - native/provider fallback readiness is now surfaced separately so the shell stops conflating primary CLI readiness with fallback profile state
 - Codex CLI turns now receive an explicit operating-memory bundle built from:
@@ -38,5 +44,5 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
 Make the CLI-first operator path genuinely humane:
 
 1. reshape the shell toward transcript/composer/proof workbench behavior
-2. run and inspect a real grounded Codex CLI turn to verify replies actually consume the operating-memory bundle
+2. reduce or properly contextualize the remaining Codex-local warnings (`state_5.sqlite` migration drift and PowerShell shell snapshot warnings)
 3. keep tightening the CLI proof surfaces so the GUI makes the live Codex session undeniable

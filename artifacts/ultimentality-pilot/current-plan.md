@@ -17,6 +17,13 @@ Completed in this slice:
    - `cargo check -p splcw-operator-gui`
    - `cargo test -p splcw-operator-gui`
    - packaged smoke test from the checked-in operator executable
+5. Fixed the two real CLI execution blockers in the operator path:
+   - grounded Codex prompts now flow through stdin instead of a giant Windows command-line argument
+   - the live `main()` now actually honors `--run-turn` instead of leaving that path stranded in the dead legacy entrypoint
+6. Verified a real grounded Codex CLI turn from both the debug operator binary and the packaged operator executable:
+   - reply proved the model read the operating-memory bundle
+   - session state persisted into `artifacts/ultimentality-pilot/operator/codex-cli-session.json`
+   - reply/event history persisted into `artifacts/ultimentality-pilot/operator/sessions/operator-main/codex-cli-turn-log.jsonl`
 
 ### Immediate Next Work
 
@@ -25,7 +32,9 @@ Completed in this slice:
    - clearer CLI session proof
    - better compose/reply flow
    - less admin-dashboard framing
-2. Audit memory/tool grounding end-to-end so every CLI turn gets the canonical operating memory without relying on brittle heuristics.
+2. Reduce operator friction around the live Codex CLI warnings:
+   - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift
+   - decide whether to repair, isolate, or deliberately ignore those warnings in the operator presentation
 3. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
 
 ### What Not To Do
