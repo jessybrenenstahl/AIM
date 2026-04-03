@@ -12,9 +12,9 @@ This is not a “merge the repos” plan.
 
 It is a synthesis plan:
 
-- `open-multi-agent` contributes execution topology
-- `openclaw` contributes control-plane/runtime continuity behavior
-- `RustyClaw` contributes Rust-native resident posture
+- [`open-multi-agent`](https://github.com/JackChen-me/open-multi-agent) contributes execution topology
+- [`openclaw`](https://github.com/openclaw/openclaw) contributes control-plane/runtime continuity behavior
+- [`RustyClaw`](https://github.com/rexlunae/RustyClaw) contributes Rust-native resident posture
 - computer-control contributes the actual body
 
 ## Relaunch Start Point
@@ -49,7 +49,7 @@ So the roadmap is ordered by the next highest-value enacted behaviors, not by ab
 
 ## Source-To-Role Map
 
-### `open-multi-agent`
+### [`open-multi-agent`](https://github.com/JackChen-me/open-multi-agent)
 
 Use for:
 
@@ -65,7 +65,7 @@ Do not use as:
 - persistent memory model
 - computer-use body
 
-### `openclaw`
+### [`openclaw`](https://github.com/openclaw/openclaw)
 
 Use for:
 
@@ -81,7 +81,7 @@ Do not use as:
 - primary desktop/body substrate
 - doctrine of permanent capability growth
 
-### `RustyClaw`
+### [`RustyClaw`](https://github.com/rexlunae/RustyClaw)
 
 Use for:
 
