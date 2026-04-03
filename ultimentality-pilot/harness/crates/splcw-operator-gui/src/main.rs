@@ -566,6 +566,8 @@ struct OperatorSnapshot {
     codex_cli_session_id: Option<String>,
     codex_cli_last_turn_summary: Option<String>,
     codex_cli_last_turn_reply: Option<String>,
+    #[serde(default)]
+    codex_cli_recent_turn_objectives: Vec<String>,
     codex_cli_recent_turn_replies: Vec<String>,
     codex_cli_recent_events: Vec<String>,
     operator_env_configured_keys: Vec<String>,
@@ -1397,9 +1399,12 @@ impl HarnessController {
         let codex_cli_session =
             read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
         let codex_cli_status = codex_cli_status(&self.paths);
+        let codex_cli_recent_turn_objectives = recent_codex_cli_turn_records
+            .iter()
+            .map(|record| record.objective.clone())
+            .collect::<Vec<_>>();
         let codex_cli_recent_turn_replies = recent_codex_cli_turn_records
             .iter()
-            .rev()
             .map(format_codex_cli_turn_reply)
             .collect::<Vec<_>>();
         let codex_cli_last_turn_reply = recent_codex_cli_turn_records
@@ -1551,6 +1556,7 @@ impl HarnessController {
                 .map(|state| state.session_id.clone()),
             codex_cli_last_turn_summary,
             codex_cli_last_turn_reply,
+            codex_cli_recent_turn_objectives,
             codex_cli_recent_turn_replies,
             codex_cli_recent_events,
             operator_env_configured_keys: operator_env_assignments

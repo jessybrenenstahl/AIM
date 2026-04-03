@@ -46,6 +46,7 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
 - the newest shell pass added direct keyboard interaction to the workbench: send prompt, start loop, and clear draft are now first-class operator actions
 - the newest session-lane pass made assistant reply cards actionable: `Use as Draft` now feeds the composer directly from the transcript
 - the newest session-lane pass expanded card actions further: assistant replies can now `Append`, and user cards can `Reuse Prompt`
+- the newest dialogue pass upgraded the CLI session lane into real prompt/reply history using stored Codex CLI objectives, and historical user prompts can now `Run Again` directly from the lane
 
 ## Immediate Next Action
 

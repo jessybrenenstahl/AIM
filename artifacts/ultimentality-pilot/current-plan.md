@@ -56,12 +56,16 @@ Completed in this slice:
    - assistant reply cards now support `Append` as well as `Use as Draft`
    - user cards now support `Reuse Prompt`
    - the transcript can now actively shape the composer in both directions instead of acting like static history
+15. Upgraded the CLI session lane into real prompt/reply history:
+   - Codex CLI conversation now renders stored historical objectives paired with their replies
+   - the lane reads oldest-to-newest, with the current draft at the tail instead of at the top
+   - historical user prompts can now `Run Again`, while the live draft can `Send Draft` directly from the lane
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
    - keep reducing the remaining stacked dashboard-card behavior
-   - make the session lane more live and interactive beyond card-driven draft controls
+   - make the session lane more live and interactive beyond historical prompt/reply controls
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift

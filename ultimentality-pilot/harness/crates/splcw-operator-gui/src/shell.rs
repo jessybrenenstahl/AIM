@@ -37,6 +37,7 @@ struct ConversationEntry {
     role: ConversationRole,
     title: String,
     body: String,
+    is_draft: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -570,6 +571,18 @@ impl OperatorShell {
         cx.notify();
     }
 
+    fn run_with_objective_draft(
+        &mut self,
+        draft: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        set_input_value(&self.objective_input, draft.into(), window, cx);
+        self.sync_form_into_state(cx);
+        self.app.begin_run(OperatorRunMode::SingleTurn);
+        cx.notify();
+    }
+
     fn append_objective_draft(
         &mut self,
         addition: impl AsRef<str>,
@@ -735,15 +748,30 @@ impl OperatorShell {
                 ConversationRole::User => h_flex()
                     .gap_2()
                     .children([
-                        Button::new(SharedString::from(format!("{id}-reuse")))
-                            .label("Reuse Prompt")
-                            .ghost()
-                            .compact()
-                            .disabled(draft_body.trim().is_empty())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_objective_draft(draft_body.clone(), window, cx);
-                            }))
-                            .into_any_element(),
+                        {
+                            let run_body = draft_body.clone();
+                            Button::new(SharedString::from(format!("{id}-run")))
+                                .label(if entry.is_draft { "Send Draft" } else { "Run Again" })
+                                .ghost()
+                                .compact()
+                                .disabled(run_body.trim().is_empty())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_with_objective_draft(run_body.clone(), window, cx);
+                                }))
+                                .into_any_element()
+                        },
+                        {
+                            let reuse_body = draft_body.clone();
+                            Button::new(SharedString::from(format!("{id}-reuse")))
+                                .label("Reuse Prompt")
+                                .ghost()
+                                .compact()
+                                .disabled(reuse_body.trim().is_empty())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_objective_draft(reuse_body.clone(), window, cx);
+                                }))
+                                .into_any_element()
+                        },
                         copy_button,
                     ])
                     .into_any_element(),
@@ -3581,36 +3609,89 @@ fn build_conversation_entries(
     prompt_draft: &str,
 ) -> Vec<ConversationEntry> {
     let mut entries = Vec::new();
+    let draft_entry = (!prompt_draft.trim().is_empty()).then(|| ConversationEntry {
+        role: ConversationRole::User,
+        title: "Draft prompt".to_string(),
+        body: prompt_draft.trim().to_string(),
+        is_draft: true,
+    });
 
-    if !prompt_draft.trim().is_empty() {
-        entries.push(ConversationEntry {
-            role: ConversationRole::User,
-            title: "Draft prompt".to_string(),
-            body: prompt_draft.trim().to_string(),
-        });
+    match engine_mode {
+        OperatorEngineMode::CodexCli => {
+            if snapshot.codex_cli_recent_turn_replies.is_empty() {
+                entries.push(ConversationEntry {
+                    role: ConversationRole::Assistant,
+                    title: "Waiting for first reply".to_string(),
+                    body:
+                            "No provider reply has been recorded yet. Send a prompt to start the session."
+                            .to_string(),
+                    is_draft: false,
+                });
+            } else if snapshot.codex_cli_recent_turn_objectives.len()
+                == snapshot.codex_cli_recent_turn_replies.len()
+            {
+                entries.extend(
+                    snapshot
+                        .codex_cli_recent_turn_objectives
+                        .iter()
+                        .zip(snapshot.codex_cli_recent_turn_replies.iter())
+                        .flat_map(|(objective, reply)| {
+                            let (title, body) = split_conversation_reply(reply);
+                            [
+                                ConversationEntry {
+                                    role: ConversationRole::User,
+                                    title: "Prompt".to_string(),
+                                    body: objective.trim().to_string(),
+                                    is_draft: false,
+                                },
+                                ConversationEntry {
+                                    role: ConversationRole::Assistant,
+                                    title,
+                                    body,
+                                    is_draft: false,
+                                },
+                            ]
+                        }),
+                );
+            } else {
+                entries.extend(snapshot.codex_cli_recent_turn_replies.iter().map(|reply| {
+                    let (title, body) = split_conversation_reply(reply);
+                    ConversationEntry {
+                        role: ConversationRole::Assistant,
+                        title,
+                        body,
+                        is_draft: false,
+                    }
+                }));
+            }
+        }
+        OperatorEngineMode::NativeHarness => {
+            let replies = &snapshot.recent_turn_replies;
+            if replies.is_empty() {
+                entries.push(ConversationEntry {
+                    role: ConversationRole::Assistant,
+                    title: "Waiting for first reply".to_string(),
+                    body:
+                            "No provider reply has been recorded yet. Send a prompt to start the session."
+                            .to_string(),
+                    is_draft: false,
+                });
+            } else {
+                entries.extend(replies.iter().map(|reply| {
+                    let (title, body) = split_conversation_reply(reply);
+                    ConversationEntry {
+                        role: ConversationRole::Assistant,
+                        title,
+                        body,
+                        is_draft: false,
+                    }
+                }));
+            }
+        }
     }
 
-    let replies = match engine_mode {
-        OperatorEngineMode::CodexCli => &snapshot.codex_cli_recent_turn_replies,
-        OperatorEngineMode::NativeHarness => &snapshot.recent_turn_replies,
-    };
-
-    if replies.is_empty() {
-        entries.push(ConversationEntry {
-            role: ConversationRole::Assistant,
-            title: "Waiting for first reply".to_string(),
-            body: "No provider reply has been recorded yet. Send a prompt to start the session."
-                .to_string(),
-        });
-    } else {
-        entries.extend(replies.iter().map(|reply| {
-            let (title, body) = split_conversation_reply(reply);
-            ConversationEntry {
-                role: ConversationRole::Assistant,
-                title,
-                body,
-            }
-        }));
+    if let Some(draft_entry) = draft_entry {
+        entries.push(draft_entry);
     }
 
     entries
