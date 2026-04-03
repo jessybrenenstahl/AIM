@@ -45,7 +45,10 @@ enum ConversationRole {
     Assistant,
 }
 
-actions!(operator_shell, [ZoomIn, ZoomOut, ResetZoom]);
+actions!(
+    operator_shell,
+    [ZoomIn, ZoomOut, ResetZoom, SendPromptAction, StartLoopAction]
+);
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -57,6 +60,10 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-=", ZoomIn, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd--", ZoomOut, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-enter", SendPromptAction, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-enter", StartLoopAction, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("cmd-_", ZoomOut, None),
         #[cfg(not(target_os = "macos"))]
@@ -73,6 +80,10 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-_", ZoomOut, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-0", ResetZoom, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-enter", SendPromptAction, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-enter", StartLoopAction, None),
     ]);
 }
 
@@ -441,6 +452,28 @@ impl OperatorShell {
         (self.zoom_scale * 100.0).round() as i32
     }
 
+    fn send_prompt_action(
+        &mut self,
+        _: &SendPromptAction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_panel == OperatorPanel::Operate {
+            self.begin_run(OperatorRunMode::SingleTurn, cx);
+        }
+    }
+
+    fn start_loop_action(
+        &mut self,
+        _: &StartLoopAction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_panel == OperatorPanel::Operate {
+            self.begin_run(OperatorRunMode::Continuous, cx);
+        }
+    }
+
     fn snapshot(&self) -> OperatorSnapshot {
         self.app
             .snapshot
@@ -517,6 +550,12 @@ impl OperatorShell {
     fn begin_run(&mut self, run_mode: OperatorRunMode, cx: &mut Context<Self>) {
         self.sync_form_into_state(cx);
         self.app.begin_run(run_mode);
+        cx.notify();
+    }
+
+    fn clear_objective_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        set_input_value(&self.objective_input, "", window, cx);
+        self.sync_form_into_state(cx);
         cx.notify();
     }
 
@@ -990,6 +1029,35 @@ impl OperatorShell {
                                                 ]),
                                         )
                                         .child(Input::new(&self.objective_input).h(px(220.0)))
+                                        .child(
+                                            h_flex()
+                                                .justify_between()
+                                                .items_center()
+                                                .gap_3()
+                                                .flex_wrap()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(shell_muted_text())
+                                                        .child(
+                                                            "Use Ctrl+Enter to send and Ctrl+Shift+Enter to start the loop.",
+                                                        ),
+                                                )
+                                                .child(
+                                                    Button::new("clear-draft")
+                                                        .label("Clear Draft")
+                                                        .ghost()
+                                                        .compact()
+                                                        .disabled(prompt_draft.trim().is_empty())
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.clear_objective_draft(
+                                                                    window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        )
                                         .child(
                                             h_flex()
                                                 .gap_3()
@@ -2159,6 +2227,8 @@ impl Render for OperatorShell {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::reset_zoom))
+            .on_action(cx.listener(Self::send_prompt_action))
+            .on_action(cx.listener(Self::start_loop_action))
             .size_full()
             .bg(shell_bg())
             .text_color(shell_text())
