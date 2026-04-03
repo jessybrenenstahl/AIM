@@ -36,12 +36,16 @@ Completed in this slice:
    - composer, run controls, and session settings now live in the same main workbench card
    - transcript sits directly beneath that workbench instead of feeling like a separate dashboard pane
    - recovery stays visible, but no longer competes with the session settings for primary attention
+10. Replaced the transcript document box with a message-style session lane:
+   - Codex replies now render as individual conversation cards
+   - prompt drafts render as a distinct `You` message
+   - each message can be copied directly from the session lane
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
    - keep reducing the remaining stacked dashboard-card behavior
-   - make the session lane feel more like a cohesive chat/work surface instead of a tall form plus transcript
+   - make the session lane more live and interactive, not just better-styled static messages
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift

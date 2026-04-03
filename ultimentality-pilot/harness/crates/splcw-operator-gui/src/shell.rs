@@ -32,6 +32,19 @@ enum DocumentSurfaceMode {
     Scroll,
 }
 
+#[derive(Clone)]
+struct ConversationEntry {
+    role: ConversationRole,
+    title: String,
+    body: String,
+}
+
+#[derive(Clone, Copy)]
+enum ConversationRole {
+    User,
+    Assistant,
+}
+
 actions!(operator_shell, [ZoomIn, ZoomOut, ResetZoom]);
 
 pub(crate) fn init(cx: &mut App) {
@@ -93,6 +106,14 @@ fn shell_chip_bg() -> Hsla {
 
 fn shell_chip_border() -> Hsla {
     gpui::rgb(0x28374b).into()
+}
+
+fn shell_user_bubble() -> Hsla {
+    gpui::rgb(0x16263b).into()
+}
+
+fn shell_assistant_bubble() -> Hsla {
+    gpui::rgb(0x0d1b2d).into()
 }
 
 fn simplify_document_text(text: &str) -> String {
@@ -1066,9 +1087,9 @@ impl OperatorShell {
                                                 .bg(shell_border()),
                                         )
                                         .child(
-                                            document_surface(
+                                            conversation_surface(
                                                 "operate-conversation",
-                                                build_conversation_markdown(
+                                                &build_conversation_entries(
                                                     self.app.engine_mode,
                                                     snapshot,
                                                     &prompt_draft,
@@ -1076,7 +1097,6 @@ impl OperatorShell {
                                                 self.zoom_scale,
                                                 28.0,
                                                 Some(52.0),
-                                                DocumentSurfaceMode::Scroll,
                                                 window,
                                                 cx,
                                             ),
@@ -2344,6 +2364,126 @@ fn document_surface(
     container.child(content).into_any_element()
 }
 
+fn conversation_surface(
+    id: impl Into<SharedString>,
+    entries: &[ConversationEntry],
+    zoom_scale: f32,
+    min_height_rem: f32,
+    max_height_rem: Option<f32>,
+    window: &mut Window,
+    cx: &mut Context<OperatorShell>,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let _ = (zoom_scale, window, cx);
+    let body = v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_3()
+        .children(entries.iter().enumerate().map(|(index, entry)| {
+            render_conversation_entry(&format!("{id}-{index}"), entry)
+        }));
+
+    div()
+        .w_full()
+        .min_w_0()
+        .min_h(rems(min_height_rem))
+        .rounded_md()
+        .border_1()
+        .border_color(shell_chip_border())
+        .bg(shell_chip_bg())
+        .p_3()
+        .overflow_hidden()
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .min_h_0()
+                .max_h(rems(max_height_rem.unwrap_or(min_height_rem + 8.0)))
+                .overflow_y_scrollbar()
+                .child(body),
+        )
+        .into_any_element()
+}
+
+fn render_conversation_entry(id: &str, entry: &ConversationEntry) -> AnyElement {
+    let (role_label, bubble_bg, role_bg, role_fg, justify_end) = match entry.role {
+        ConversationRole::User => (
+            "You",
+            shell_user_bubble(),
+            gpui::rgb(0x245c9c).into(),
+            shell_text(),
+            true,
+        ),
+        ConversationRole::Assistant => (
+            "Codex",
+            shell_assistant_bubble(),
+            gpui::rgb(0x1d3d63).into(),
+            shell_text(),
+            false,
+        ),
+    };
+    let copy_body = entry.body.clone();
+    let bubble = v_flex()
+        .gap_3()
+        .max_w(px(980.0))
+        .w_full()
+        .min_w_0()
+        .rounded_lg()
+        .border_1()
+        .border_color(shell_chip_border())
+        .bg(bubble_bg)
+        .p_4()
+        .child(
+            h_flex()
+                .justify_between()
+                .items_start()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(status_pill(role_label, role_bg, role_fg))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(shell_text())
+                                .child(entry.title.clone()),
+                        ),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("{id}-copy")))
+                        .label("Copy")
+                        .ghost()
+                        .compact()
+                        .disabled(copy_body.trim().is_empty())
+                        .on_click(move |_, _, app| {
+                            app.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
+                        }),
+                ),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .children(entry.body.lines().map(render_document_line)),
+        );
+
+    if justify_end {
+        h_flex()
+            .w_full()
+            .justify_end()
+            .child(bubble)
+            .into_any_element()
+    } else {
+        h_flex()
+            .w_full()
+            .justify_start()
+            .child(bubble)
+            .into_any_element()
+    }
+}
+
 fn optional_button(
     label: Option<String>,
     enabled: bool,
@@ -3107,15 +3247,19 @@ fn build_activity_markdown(snapshot: &OperatorSnapshot) -> String {
     format!("# Runtime Details\n\n{}", lines.join("\n"))
 }
 
-fn build_conversation_markdown(
+fn build_conversation_entries(
     engine_mode: OperatorEngineMode,
     snapshot: &OperatorSnapshot,
     prompt_draft: &str,
-) -> String {
-    let mut sections = vec!["# Conversation".to_string()];
+) -> Vec<ConversationEntry> {
+    let mut entries = Vec::new();
 
     if !prompt_draft.trim().is_empty() {
-        sections.push(format!("## You\n\n{}", prompt_draft.trim()));
+        entries.push(ConversationEntry {
+            role: ConversationRole::User,
+            title: "Draft prompt".to_string(),
+            body: prompt_draft.trim().to_string(),
+        });
     }
 
     let replies = match engine_mode {
@@ -3124,17 +3268,51 @@ fn build_conversation_markdown(
     };
 
     if replies.is_empty() {
-        sections.push(
-            "## Codex\n\nNo provider reply has been recorded yet. Send a prompt to start the session."
+        entries.push(ConversationEntry {
+            role: ConversationRole::Assistant,
+            title: "Waiting for first reply".to_string(),
+            body: "No provider reply has been recorded yet. Send a prompt to start the session."
                 .to_string(),
-        );
+        });
     } else {
-        for reply in replies {
-            sections.push(reply.clone());
-        }
+        entries.extend(replies.iter().map(|reply| {
+            let (title, body) = split_conversation_reply(reply);
+            ConversationEntry {
+                role: ConversationRole::Assistant,
+                title,
+                body,
+            }
+        }));
     }
 
-    sections.join("\n\n")
+    entries
+}
+
+fn split_conversation_reply(reply: &str) -> (String, String) {
+    let trimmed = reply.trim();
+    if let Some(rest) = trimmed.strip_prefix("# ") {
+        if let Some((title, body)) = rest.split_once('\n') {
+            let body = body.trim();
+            return (
+                title.trim().to_string(),
+                if body.is_empty() {
+                    "Reply body is empty.".to_string()
+                } else {
+                    body.to_string()
+                },
+            );
+        }
+        return (rest.trim().to_string(), "Reply body is empty.".to_string());
+    }
+
+    (
+        "Codex reply".to_string(),
+        if trimmed.is_empty() {
+            "Reply body is empty.".to_string()
+        } else {
+            trimmed.to_string()
+        },
+    )
 }
 
 fn build_recent_replies_markdown(

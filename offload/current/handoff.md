@@ -41,6 +41,7 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
 - the latest shell pass widened the main work surface and improved document rendering so replies with quotes, numbered steps, and fenced blocks survive the GUI more faithfully
 - the next shell pass made the session chronology read naturally again and exposed the live CLI session more directly in the top-level workbench metadata
 - the latest shell pass merged composer, run controls, and session settings into one continuous session workspace so Operate reads less like separate dashboard cards
+- the newest shell pass replaced the transcript document box with message-style conversation cards so the session reads more like a real client conversation
 
 ## Immediate Next Action
 
