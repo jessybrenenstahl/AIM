@@ -1,0 +1,21 @@
+[package]
+name = "splcw-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+splcw-computer-use = { path = "../splcw-computer-use" }
+splcw-core = { path = "../splcw-core" }
+splcw-host = { path = "../splcw-host" }
+splcw-llm = { path = "../splcw-llm" }
+splcw-memory = { path = "../splcw-memory" }
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
