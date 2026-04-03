@@ -13,11 +13,6 @@ use gpui_component::{
 use gpui_component::{button::Button, button::ButtonVariants as _};
 
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const NATIVE_CODEX_ENGINE_LABEL: &str = "Native Codex runtime";
-const NATIVE_CODEX_ENGINE_SUMMARY: &str =
-    "This operator shell is a harness-native Codex client, not a wrapped Codex CLI session.";
-const OPENAI_CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const SHELL_CONTEXT: &str = "OperatorShell";
 const ZOOM_MIN: f32 = 0.70;
 const ZOOM_MAX: f32 = 1.65;
@@ -224,7 +219,7 @@ impl OperatorPanel {
                 "Launch bounded turns, inspect runtime identity, and keep the live session understandable."
             }
             Self::Auth => {
-                "Manage native Codex auth, inspect pending OAuth, and verify the selected provider is truly ready."
+                "Manage provider auth, inspect pending OAuth, and verify the selected provider is ready."
             }
             Self::Background => {
                 "Own detached runner state, handoffs, crash recovery, and reattach behavior from one place."
@@ -495,7 +490,7 @@ impl OperatorShell {
 
         let mut pills = vec![
             status_pill(
-                NATIVE_CODEX_ENGINE_LABEL,
+                "AGRO Operator",
                 cx.theme().secondary,
                 cx.theme().secondary_foreground,
             ),
@@ -1150,7 +1145,7 @@ impl OperatorShell {
                                 .min_w_0()
                                 .child(card(
                                     "Provider & Sign-in",
-                                    Some("Native Codex auth is primary. Fallbacks stay visible but clearly secondary."),
+                                    Some("Primary auth provider selected. Fallbacks stay visible but clearly secondary."),
                                     v_flex()
                                         .gap_3()
                                         .child(
@@ -2081,10 +2076,7 @@ fn build_engine_identity_markdown(
     snapshot: &OperatorSnapshot,
     settings: &RunSettings,
 ) -> String {
-    let endpoint = match provider {
-        OperatorAuthProvider::OpenAiCodex => OPENAI_CODEX_ENDPOINT,
-        OperatorAuthProvider::OpenAiApi => OPENAI_API_ENDPOINT,
-    };
+    let endpoint = "https://api.openai.com/v1/responses";
     let pending_turn = effective_pending_phase_label(snapshot);
     let last_completed_round = snapshot
         .recent_events
@@ -2094,7 +2086,7 @@ fn build_engine_identity_markdown(
         .cloned()
         .unwrap_or_else(|| "No completed provider round recorded yet.".to_string());
     format!(
-        "# Codex Connection Proof\n\n- **Engine mode:** {NATIVE_CODEX_ENGINE_LABEL}\n- **Summary:** {NATIVE_CODEX_ENGINE_SUMMARY}\n- **Provider:** {}\n- **Endpoint:** `{endpoint}`\n- **Model:** `{}`\n- **Thread:** `{}` ({})\n- **Pending turn phase:** `{pending_turn}`\n- **Foreground runtime:** `{}`\n- **Background runner:** `{}`\n- **Auth evidence:** {}\n- **Latest completed provider round:** {}\n\n> This is proof of a live native Codex backend connection. It is not proof of a visible Codex CLI session because this shell is the client.",
+        "# AGRO Connection Proof\n\n- **Provider:** {}\n- **Endpoint:** `{endpoint}`\n- **Model:** `{}`\n- **Thread:** `{}` ({})\n- **Pending turn phase:** `{pending_turn}`\n- **Foreground runtime:** `{}`\n- **Background runner:** `{}`\n- **Auth evidence:** {}\n- **Latest completed provider round:** {}\n\n> This operator frontend authenticates to the selected provider and manages the AGRO workflow.",
         provider.as_label(),
         settings.model,
         settings.thread_id,

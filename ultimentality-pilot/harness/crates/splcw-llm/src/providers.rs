@@ -24,7 +24,6 @@ use crate::{
 };
 
 const DEFAULT_OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
-const DEFAULT_OPENAI_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEFAULT_OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_OPENAI_OAUTH_DEVICE_AUTHORIZATION_URL: &str =
@@ -40,7 +39,6 @@ const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OPENAI_MAX_RETRIES: usize = 1;
 const DEFAULT_OPENAI_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const BUILTIN_OPENAI_CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_OPENAI_CODEX_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
 #[derive(Debug, Clone)]
 pub struct OpenAiOAuthConfig {
@@ -208,11 +206,8 @@ fn env_trimmed(name: &str) -> Option<String> {
     })
 }
 
-fn default_openai_responses_endpoint(provider: &ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::OpenAiCodex => DEFAULT_OPENAI_CODEX_RESPONSES_URL,
-        _ => DEFAULT_OPENAI_RESPONSES_URL,
-    }
+fn default_openai_responses_endpoint(_provider: &ProviderKind) -> &'static str {
+    DEFAULT_OPENAI_RESPONSES_URL
 }
 
 pub struct OpenAiResponsesProvider {
@@ -1308,9 +1303,6 @@ fn inspect_oauth_runtime_auth(auth: &AuthProfile, oauth: &OAuthState) -> Runtime
 
 impl OpenAiResponsesProvider {
     async fn send_once(&self, bearer: &str, body: &Value) -> anyhow::Result<Value> {
-        if self.descriptor.provider == ProviderKind::OpenAiCodex {
-            return self.send_codex_once(bearer, body).await;
-        }
         self.send_standard_once(bearer, body).await
     }
 
@@ -1378,70 +1370,6 @@ impl OpenAiResponsesProvider {
         serde_json::from_str(&text).context("deserialize OpenAI response")
     }
 
-    async fn send_codex_once(&self, bearer: &str, body: &Value) -> anyhow::Result<Value> {
-        let response = timeout(self.request_timeout, async {
-            self.client
-                .post(&self.endpoint)
-                .bearer_auth(bearer)
-                .header("Accept", "text/event-stream")
-                .json(body)
-                .send()
-                .await
-        })
-        .await
-        .map_err(|_| {
-            self.provider_error(
-                "responses_api",
-                ProviderErrorCategory::Timeout,
-                None,
-                Some(false),
-            )
-        })
-        .with_context(|| format!("OpenAI request timed out after {:?}", self.request_timeout))?
-        .map_err(|error| {
-            let category = if error.is_timeout() {
-                ProviderErrorCategory::Timeout
-            } else {
-                ProviderErrorCategory::Network
-            };
-            self.provider_error("responses_api", category, error.status(), Some(false))
-                .context(format!("POST {}", self.endpoint))
-        })?;
-        let status = response.status();
-        let text = timeout(self.request_timeout, response.text())
-            .await
-            .map_err(|_| {
-                self.provider_error(
-                    "responses_api_response_body",
-                    ProviderErrorCategory::Timeout,
-                    Some(status),
-                    Some(false),
-                )
-            })
-            .with_context(|| {
-                format!(
-                    "OpenAI response body timed out after {:?}",
-                    self.request_timeout
-                )
-            })?
-            .context("read OpenAI response body")?;
-        if !status.is_success() {
-            return Err(self
-                .provider_error(
-                    "responses_api",
-                    openai_category_from_status(status, &text),
-                    Some(status),
-                    Some(is_retryable_status(status)),
-                )
-                .context(format!(
-                    "OpenAI responses API status_code={} retryable={} body={}",
-                    status.as_u16(),
-                    is_retryable_status(status),
-                    summarize_error_body(&text)
-                )));
-        }
-        parse_openai_event_stream_response(&text)
-    }
 }
 
 fn build_responses_request(request: &ChatRequest, provider: &ProviderKind) -> Value {
@@ -1464,18 +1392,11 @@ fn build_responses_request(request: &ChatRequest, provider: &ProviderKind) -> Va
         "model": request.model,
         "input": input,
     });
-    if matches!(provider, ProviderKind::OpenAiCodex) && instructions.is_empty() {
-        instructions.push(DEFAULT_OPENAI_CODEX_INSTRUCTIONS.to_string());
-    }
     if !instructions.is_empty() {
         body["instructions"] = json!(instructions.join("\n\n"));
     }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
-    }
-    if matches!(provider, ProviderKind::OpenAiCodex) {
-        body["store"] = json!(false);
-        body["stream"] = json!(true);
     }
     body
 }
@@ -1497,113 +1418,23 @@ fn build_input_items(
             continue;
         }
 
-        if matches!(provider, ProviderKind::OpenAiCodex) {
-            input.extend(build_codex_input_items_for_message(&role, &message.content));
-        } else {
-            let content = message
-                .content
-                .iter()
-                .map(block_to_input_item)
-                .collect::<Vec<_>>();
-            if content.is_empty() {
-                continue;
-            }
-            input.push(json!({
-                "role": role,
-                "content": content,
-            }));
+        let content = message
+            .content
+            .iter()
+            .map(block_to_input_item)
+            .collect::<Vec<_>>();
+        if content.is_empty() {
+            continue;
         }
+        input.push(json!({
+            "role": role,
+            "content": content,
+        }));
     }
 
     input
 }
 
-fn build_codex_input_items_for_message(role: &str, content: &[ContentBlock]) -> Vec<Value> {
-    let mut items = Vec::new();
-
-    match role {
-        "assistant" => {
-            let mut assistant_content = Vec::new();
-            for block in content {
-                match block {
-                    ContentBlock::Text { text } => assistant_content.push(json!({
-                        "type": "output_text",
-                        "text": text,
-                    })),
-                    ContentBlock::ImagePath { path } => assistant_content.push(json!({
-                        "type": "output_text",
-                        "text": format!("[local image path] {}", path),
-                    })),
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => items.push(json!({
-                        "type": "function_call",
-                        "call_id": id,
-                        "name": name,
-                        "arguments": arguments.to_string(),
-                    })),
-                    ContentBlock::ToolResult { id, content } => items.push(json!({
-                        "type": "function_call_output",
-                        "call_id": id,
-                        "output": function_call_output_value(content),
-                    })),
-                }
-            }
-            if !assistant_content.is_empty() {
-                items.insert(
-                    0,
-                    json!({
-                        "role": "assistant",
-                        "content": assistant_content,
-                    }),
-                );
-            }
-        }
-        _ => {
-            let mut message_content = Vec::new();
-            for block in content {
-                match block {
-                    ContentBlock::Text { text } => message_content.push(json!({
-                        "type": "input_text",
-                        "text": text,
-                    })),
-                    ContentBlock::ImagePath { path } => message_content.push(json!({
-                        "type": "input_text",
-                        "text": format!("[local image path] {}", path),
-                    })),
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => items.push(json!({
-                        "type": "function_call",
-                        "call_id": id,
-                        "name": name,
-                        "arguments": arguments.to_string(),
-                    })),
-                    ContentBlock::ToolResult { id, content } => items.push(json!({
-                        "type": "function_call_output",
-                        "call_id": id,
-                        "output": function_call_output_value(content),
-                    })),
-                }
-            }
-            if !message_content.is_empty() {
-                items.insert(
-                    0,
-                    json!({
-                        "role": role,
-                        "content": message_content,
-                    }),
-                );
-            }
-        }
-    }
-
-    items
-}
 
 fn parse_openai_event_stream_response(body: &str) -> anyhow::Result<Value> {
     let normalized = body.replace("\r\n", "\n");
@@ -2022,81 +1853,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_provider_defaults_to_chatgpt_backend_endpoint() {
+    fn codex_provider_defaults_to_standard_openai_endpoint() {
         let provider =
             OpenAiResponsesProvider::new(openai_codex_descriptor("gpt-5.4"), None::<String>)
                 .unwrap();
 
-        assert_eq!(provider.endpoint, DEFAULT_OPENAI_CODEX_RESPONSES_URL);
+        assert_eq!(provider.endpoint, DEFAULT_OPENAI_RESPONSES_URL);
     }
 
-    #[test]
-    fn build_codex_request_uses_codex_transport_requirements() {
-        let mut request = sample_request();
-        request.system_prompt = None;
-
-        let body = build_responses_request(&request, &ProviderKind::OpenAiCodex);
-
-        assert_eq!(body["model"], "gpt-5.4-mini");
-        assert_eq!(body["instructions"], DEFAULT_OPENAI_CODEX_INSTRUCTIONS);
-        assert_eq!(body["store"], false);
-        assert_eq!(body["stream"], true);
-        assert_eq!(
-            body["tools"][0]["parameters"]["additionalProperties"],
-            false
-        );
-    }
-
-    #[test]
-    fn build_codex_request_replays_assistant_output_as_responses_items() {
-        let request = ChatRequest {
-            model: "gpt-5.4-mini".into(),
-            system_prompt: Some("Stay bounded.".into()),
-            messages: vec![
-                ChatMessage {
-                    role: "user".into(),
-                    content: vec![ContentBlock::Text {
-                        text: "Observe the desktop.".into(),
-                    }],
-                },
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: vec![
-                        ContentBlock::Text {
-                            text: "I can act now.".into(),
-                        },
-                        ContentBlock::ToolCall {
-                            id: "call_123".into(),
-                            name: "host_action".into(),
-                            arguments: json!({"kind": "focus_window"}),
-                        },
-                    ],
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: vec![ContentBlock::ToolResult {
-                        id: "call_123".into(),
-                        content: json!({"status": "ok"}),
-                    }],
-                },
-            ],
-            tools: vec![],
-        };
-
-        let body = build_responses_request(&request, &ProviderKind::OpenAiCodex);
-
-        assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(body["input"][1]["role"], "assistant");
-        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
-        assert_eq!(body["input"][1]["content"][0]["text"], "I can act now.");
-        assert_eq!(body["input"][2]["type"], "function_call");
-        assert_eq!(body["input"][2]["call_id"], "call_123");
-        assert_eq!(body["input"][2]["name"], "host_action");
-        assert_eq!(body["input"][3]["type"], "function_call_output");
-        assert_eq!(body["input"][3]["call_id"], "call_123");
-        assert_eq!(body["input"][3]["output"], "{\"status\":\"ok\"}");
-    }
 
     #[test]
     fn tool_schema_closes_nested_object_properties() {
@@ -2715,41 +2479,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn openai_codex_provider_parses_streaming_response() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let stream_body = concat!(
-            "event: response.created\n",
-            "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.4\",\"output\":[]}}\n\n",
-            "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            stream_body.len(),
-            stream_body
-        );
-        let endpoint = spawn_response_server(vec![(response, Duration::ZERO)], hits.clone()).await;
-        let provider = OpenAiResponsesProvider::with_transport_policy(
-            openai_codex_descriptor("gpt-5.4"),
-            Some(endpoint),
-            Duration::from_millis(200),
-            0,
-            Duration::from_millis(10),
-        )
-        .unwrap();
-
-        let response = provider
-            .chat(&sample_ready_oauth_profile(), &sample_request())
-            .await
-            .unwrap();
-
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            response.content.first(),
-            Some(ContentBlock::Text { text }) if text == "ok"
-        ));
-    }
 
     #[tokio::test]
     async fn openai_provider_materializes_refresh_token() {

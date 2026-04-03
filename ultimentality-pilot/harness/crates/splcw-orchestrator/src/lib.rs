@@ -1,3 +1,6 @@
+mod compaction_publisher;
+mod gap_task_emitter;
+mod host_verify_retry;
 mod runtime;
 mod session;
 
@@ -14,6 +17,16 @@ use splcw_memory::{
 };
 use uuid::Uuid;
 
+pub use compaction_publisher::{
+    CompactionPublishReceipt, MirrorPublishConfig, find_repo_root, publish_compaction_to_mirror,
+};
+pub use gap_task_emitter::{
+    GapTask, GapTaskStatus, build_gap_task_context, defer_oldest_pending_task, emit_gap_task,
+    mark_oldest_pending_task_resolved, read_pending_gap_tasks,
+};
+pub use host_verify_retry::{
+    MAX_STABILIZATION_ATTEMPTS, STABILIZATION_DELAY, StabilizationOutcome, stabilize_host_effect,
+};
 pub use runtime::{
     RuntimeTurnOptions, RuntimeTurnOutcome, SupervisedGithubActionKind,
     SupervisedGithubActionRequest,

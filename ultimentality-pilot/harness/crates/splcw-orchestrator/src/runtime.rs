@@ -21,6 +21,9 @@ use crate::{
     RuntimeSessionEvent, RuntimeSessionJournal, RuntimeToolOutcomeRecord, RuntimeTurnRecord,
 };
 
+use crate::gap_task_emitter::emit_gap_task;
+use crate::host_verify_retry::{StabilizationOutcome, stabilize_host_effect};
+
 const HOST_ACTION_TOOL: &str = "host_action";
 const CAPABILITY_GAP_TOOL: &str = "capability_gap";
 const SUPERVISED_GITHUB_ACTION_TOOL: &str = "supervised_github_action";
@@ -1171,6 +1174,8 @@ where
             .hydrate(options.receipt_context_limit)
             .await?
             .context("cannot run runtime turn without a current plan snapshot")?;
+        let gap_task_root: Option<std::path::PathBuf> =
+            session_journal.as_ref().map(|j| j.session_root());
         let session_event_id = options
             .session
             .as_ref()
@@ -1217,6 +1222,7 @@ where
                         "runtime-session",
                         &checkpoint.observation,
                         "",
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 if let Some(journal) = session_journal.as_ref() {
@@ -1284,6 +1290,7 @@ where
                         "runtime-session",
                         &checkpoint.observation,
                         "",
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 if let Some(journal) = session_journal.as_ref() {
@@ -1344,6 +1351,7 @@ where
                             "runtime-session",
                             &checkpoint.observation,
                             "",
+                            gap_task_root.as_deref(),
                         )
                         .await?;
                     if let Some(journal) = session_journal.as_ref() {
@@ -1440,6 +1448,7 @@ where
                                 "host observation timed out before runtime turn",
                             ),
                             "",
+                            gap_task_root.as_deref(),
                         )
                         .await?;
                     if let Some(journal) = session_journal.as_ref() {
@@ -1492,12 +1501,30 @@ where
                     });
                 }
             };
+            // Load always-on operating memory from os.md + memory.md (non-fatal if missing).
+            let operating_memory: Option<String> = {
+                let memory_dir = session_journal
+                    .as_ref()
+                    .and_then(|j| {
+                        crate::compaction_publisher::find_repo_root(&j.session_root()).ok()
+                    })
+                    .map(|repo| repo.join("artifacts/ultimentality-pilot/memory"));
+                if let Some(dir) = memory_dir {
+                    let os_content = tokio::fs::read_to_string(dir.join("os.md")).await.unwrap_or_default();
+                    let mem_content = tokio::fs::read_to_string(dir.join("memory.md")).await.unwrap_or_default();
+                    let combined = format!("{}\n\n---\n\n{}", os_content.trim(), mem_content.trim());
+                    if combined.trim() == "---" { None } else { Some(combined) }
+                } else {
+                    None
+                }
+            };
             (
                 observation.clone(),
                 runtime_system_prompt(
                     post_compaction_refresh.as_deref(),
                     thread_context.as_deref(),
                     turn_history_context.as_deref(),
+                    operating_memory.as_deref(),
                 ),
                 build_initial_runtime_messages(
                     &state,
@@ -1604,6 +1631,7 @@ where
                                     "runtime-provider",
                                     last_verification.as_ref().unwrap_or(&observation),
                                     &final_narrative,
+                                    gap_task_root.as_deref(),
                                 )
                                 .await?;
                             if let Some(journal) = session_journal.as_ref() {
@@ -1700,6 +1728,7 @@ where
                         &provider_id,
                         &observation,
                         &narrative,
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 append_session_event_if_present(
@@ -1779,6 +1808,7 @@ where
                         &provider_id,
                         &observation,
                         &narrative,
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 append_session_event_if_present(
@@ -1855,6 +1885,7 @@ where
                         &provider_id,
                         &observation,
                         &narrative,
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 append_session_event_if_present(
@@ -1927,6 +1958,7 @@ where
                                 &provider_id,
                                 &observation,
                                 &narrative,
+                                gap_task_root.as_deref(),
                             )
                             .await?;
                         append_session_event_if_present(
@@ -2127,6 +2159,7 @@ where
                         &provider_id,
                         &observation,
                         &narrative,
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 append_session_event_if_present(
@@ -2201,6 +2234,7 @@ where
                         &provider_id,
                         &observation,
                         &narrative,
+                        gap_task_root.as_deref(),
                     )
                     .await?;
                 append_session_event_if_present(
@@ -2264,6 +2298,7 @@ where
                                 &provider_id,
                                 &observation,
                                 &narrative,
+                                gap_task_root.as_deref(),
                             )
                             .await?;
                         append_session_event_if_present(
@@ -2413,6 +2448,7 @@ where
                             &provider_id,
                             last_verification.as_ref().unwrap_or(&observation),
                             &narrative,
+                            gap_task_root.as_deref(),
                         )
                         .await?;
                     if let Some(journal) = session_journal.as_ref() {
@@ -2480,6 +2516,7 @@ where
                             &provider_id,
                             last_verification.as_ref().unwrap_or(&observation),
                             &narrative,
+                            gap_task_root.as_deref(),
                         )
                         .await?;
                     if let Some(journal) = session_journal.as_ref() {
@@ -2548,7 +2585,32 @@ where
             .await
             {
                 Ok(Ok(verification)) => verification,
-                Ok(Err(error)) => {
+                Ok(Err(ref verify_error)) => {
+                    // Attempt bounded stabilization before declaring uncertain.
+                    let stabilized = stabilize_host_effect(
+                        host,
+                        &action,
+                        &execution,
+                        |_obs| Ok(true), // any successful observe is treated as settled
+                        |obs| format!("verify hard error: {verify_error:#}; last_obs: {}", obs.summary),
+                        options.host_verify_timeout,
+                        None,
+                        None,
+                    )
+                    .await;
+                    if let Ok(StabilizationOutcome::Settled {
+                        observation: stable_obs,
+                        attempt,
+                    }) = stabilized
+                    {
+                        tracing::info!(
+                            "host verification hard error resolved by stabilization after {attempt} attempt(s)"
+                        );
+                        last_verification = Some(stable_obs);
+                        // Continue to the next round rather than surfacing a gap.
+                        continue;
+                    }
+                    let verify_error = verify_error;
                     let gap = self
                         .surface_runtime_gap(
                             CapabilityGapDirective {
@@ -2559,11 +2621,12 @@ where
                                 permanent_fix_target:
                                     "Add a reusable host verification recovery and fallback observation path for this action class"
                                         .into(),
-                                notes: vec![format!("{error:#}")],
+                                notes: vec![format!("{verify_error:#}")],
                             },
                             &provider_id,
                             last_verification.as_ref().unwrap_or(&observation),
                             &narrative,
+                            gap_task_root.as_deref(),
                         )
                         .await?;
                     if let Some(journal) = session_journal.as_ref() {
@@ -2631,6 +2694,7 @@ where
                             &provider_id,
                             last_verification.as_ref().unwrap_or(&observation),
                             &narrative,
+                            gap_task_root.as_deref(),
                         )
                         .await?;
                     if let Some(journal) = session_journal.as_ref() {
@@ -2722,6 +2786,7 @@ where
                     &provider_id,
                     &verification,
                     &narrative,
+                    gap_task_root.as_deref(),
                 )
                 .await?,
             )
@@ -2885,6 +2950,7 @@ where
                 &final_provider_id,
                 last_verification.as_ref().unwrap_or(&observation),
                 &final_narrative,
+                gap_task_root.as_deref(),
             )
             .await?;
         if let Some(journal) = session_journal.as_ref() {
@@ -2953,6 +3019,7 @@ where
         provider_id: &str,
         observation: &ObservationFrame,
         narrative: &str,
+        session_root: Option<&std::path::Path>,
     ) -> anyhow::Result<CapabilityGap> {
         let now = Utc::now();
         let mut notes = directive.notes;
@@ -2973,6 +3040,11 @@ where
             notes,
         };
         self.surface_gap(&gap).await?;
+        if let Some(root) = session_root {
+            if let Err(e) = emit_gap_task(root, &gap).await {
+                tracing::warn!("gap task emission failed (non-fatal): {e:#}");
+            }
+        }
         Ok(gap)
     }
 }
@@ -3307,6 +3379,7 @@ fn runtime_system_prompt(
     post_compaction_refresh: Option<&str>,
     thread_context: Option<&str>,
     turn_history_context: Option<&str>,
+    operating_memory: Option<&str>,
 ) -> String {
     let mut lines = vec![
         "You are the bounded SPLCW runtime controller.",
@@ -3345,6 +3418,12 @@ fn runtime_system_prompt(
         lines.push("[Recent runtime turns]");
         lines.push("Use the persisted recent bounded-turn ledger below as durable continuity about what the runtime already tried and what the world did in response:");
         lines.push(turn_history_context);
+    }
+    if let Some(memory) = operating_memory {
+        lines.push("");
+        lines.push("[Operating memory]");
+        lines.push("The following always-on context is injected into every turn from durable memory files. Treat it as server-trusted continuity:");
+        lines.push(memory);
     }
     lines.join("\n")
 }

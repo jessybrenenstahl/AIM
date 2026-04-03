@@ -698,6 +698,12 @@ impl RuntimeSessionJournal {
         self.repaired
     }
 
+    /// Returns the root directory for this session (the directory that holds state.json,
+    /// the transcript, gap-task-queue.jsonl, etc.).
+    pub fn session_root(&self) -> std::path::PathBuf {
+        self.config.root_dir.join(&self.config.session_id)
+    }
+
     pub fn state(&self) -> &RuntimeSessionState {
         &self.state
     }
@@ -1310,6 +1316,32 @@ impl RuntimeSessionJournal {
         self.state.pending_compaction = None;
         self.state.current_transcript_path = next_transcript_name;
         persist_state(&self.state_path, &self.state).await?;
+
+        // Mirror push: publish compaction checkpoint to the git remote so
+        // reconcile_mirror_continuity can verify drift on next turn.
+        {
+            use crate::compaction_publisher::{MirrorPublishConfig, find_repo_root, publish_compaction_to_mirror};
+            let session_root = self.session_root();
+            if let Ok(repo_root) = find_repo_root(&session_root) {
+                let publish_config = MirrorPublishConfig {
+                    repo_root,
+                    branch: "main".into(),
+                    ..MirrorPublishConfig::default()
+                };
+                match publish_compaction_to_mirror(&publish_config, next_count, &self.config.session_id).await {
+                    Ok(receipt) => {
+                        tracing::info!(
+                            "compaction mirror push ok: sha={:?} dir={}",
+                            receipt.committed_sha,
+                            receipt.checkpoint_dir,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("compaction mirror push failed (non-fatal): {e:#}");
+                    }
+                }
+            }
+        }
 
         self.append_event_locked(&RuntimeSessionEvent::compaction_completed(
             &self.config.session_id,
