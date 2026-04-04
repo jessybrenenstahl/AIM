@@ -38,9 +38,11 @@ struct ConversationEntry {
     title: String,
     body: String,
     is_draft: bool,
+    is_live: bool,
+    footer_lines: Vec<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ConversationRole {
     User,
     Assistant,
@@ -717,6 +719,13 @@ impl OperatorShell {
         let copy_body = entry.body.clone();
         let draft_body = entry.body.clone();
         let append_body = entry.body.clone();
+        let mut role_pills = vec![status_pill(role_label, role_bg, role_fg).into_any_element()];
+        if entry.is_live {
+            role_pills.push(
+                status_pill("Streaming", cx.theme().warning, cx.theme().warning_foreground)
+                    .into_any_element(),
+            );
+        }
         let actions = {
             let copy_button = Button::new(SharedString::from(format!("{id}-copy")))
                 .label("Copy")
@@ -727,61 +736,65 @@ impl OperatorShell {
                     app.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
                 })
                 .into_any_element();
-            match entry.role {
-                ConversationRole::Assistant => h_flex()
-                    .gap_2()
-                    .children([
-                        Button::new(SharedString::from(format!("{id}-append")))
-                            .label("Append")
-                            .ghost()
-                            .compact()
-                            .disabled(append_body.trim().is_empty())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.append_objective_draft(&append_body, window, cx);
-                            }))
-                            .into_any_element(),
-                        Button::new(SharedString::from(format!("{id}-draft")))
-                            .label("Use as Draft")
-                            .ghost()
-                            .compact()
-                            .disabled(draft_body.trim().is_empty())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_objective_draft(draft_body.clone(), window, cx);
-                            }))
-                            .into_any_element(),
-                        copy_button,
-                    ])
-                    .into_any_element(),
-                ConversationRole::User => h_flex()
-                    .gap_2()
-                    .children([
-                        {
-                            let run_body = draft_body.clone();
-                            Button::new(SharedString::from(format!("{id}-run")))
-                                .label(if entry.is_draft { "Send Draft" } else { "Run Again" })
+            if entry.is_live {
+                copy_button
+            } else {
+                match entry.role {
+                    ConversationRole::Assistant => h_flex()
+                        .gap_2()
+                        .children([
+                            Button::new(SharedString::from(format!("{id}-append")))
+                                .label("Append")
                                 .ghost()
                                 .compact()
-                                .disabled(run_body.trim().is_empty())
+                                .disabled(append_body.trim().is_empty())
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_with_objective_draft(run_body.clone(), window, cx);
+                                    this.append_objective_draft(&append_body, window, cx);
                                 }))
-                                .into_any_element()
-                        },
-                        {
-                            let reuse_body = draft_body.clone();
-                            Button::new(SharedString::from(format!("{id}-reuse")))
-                                .label("Reuse Prompt")
+                                .into_any_element(),
+                            Button::new(SharedString::from(format!("{id}-draft")))
+                                .label("Use as Draft")
                                 .ghost()
                                 .compact()
-                                .disabled(reuse_body.trim().is_empty())
+                                .disabled(draft_body.trim().is_empty())
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.set_objective_draft(reuse_body.clone(), window, cx);
+                                    this.set_objective_draft(draft_body.clone(), window, cx);
                                 }))
-                                .into_any_element()
-                        },
-                        copy_button,
-                    ])
-                    .into_any_element(),
+                                .into_any_element(),
+                            copy_button,
+                        ])
+                        .into_any_element(),
+                    ConversationRole::User => h_flex()
+                        .gap_2()
+                        .children([
+                            {
+                                let run_body = draft_body.clone();
+                                Button::new(SharedString::from(format!("{id}-run")))
+                                    .label(if entry.is_draft { "Send Draft" } else { "Run Again" })
+                                    .ghost()
+                                    .compact()
+                                    .disabled(run_body.trim().is_empty())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.run_with_objective_draft(run_body.clone(), window, cx);
+                                    }))
+                                    .into_any_element()
+                            },
+                            {
+                                let reuse_body = draft_body.clone();
+                                Button::new(SharedString::from(format!("{id}-reuse")))
+                                    .label("Reuse Prompt")
+                                    .ghost()
+                                    .compact()
+                                    .disabled(reuse_body.trim().is_empty())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_objective_draft(reuse_body.clone(), window, cx);
+                                    }))
+                                    .into_any_element()
+                            },
+                            copy_button,
+                        ])
+                        .into_any_element(),
+                }
             }
         };
 
@@ -803,7 +816,7 @@ impl OperatorShell {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(status_pill(role_label, role_bg, role_fg))
+                            .child(h_flex().gap_2().flex_wrap().children(role_pills))
                             .child(
                                 div()
                                     .text_sm()
@@ -821,6 +834,23 @@ impl OperatorShell {
                     .gap_1()
                     .children(entry.body.lines().map(render_document_line)),
             );
+        let bubble = if entry.footer_lines.is_empty() {
+            bubble
+        } else {
+            bubble.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .pt_1()
+                    .children(entry.footer_lines.iter().cloned().map(|line| {
+                        div()
+                            .text_xs()
+                            .text_color(shell_muted_text())
+                            .child(line)
+                    })),
+            )
+        };
 
         if justify_end {
             h_flex()
@@ -1158,6 +1188,11 @@ impl OperatorShell {
             matches!(self.app.engine_mode, OperatorEngineMode::NativeHarness)
                 && provider_retry_needed(snapshot);
         let prompt_draft = self.objective_input.read(cx).value().to_string();
+        let conversation_min_height = if snapshot.codex_cli_live_stream_active {
+            34.0
+        } else {
+            28.0
+        };
         let provider_recovery_surface = match self.app.engine_mode {
             OperatorEngineMode::CodexCli if !snapshot.codex_cli_logged_in => empty_state(
                 "Codex CLI login is required",
@@ -1395,7 +1430,7 @@ impl OperatorShell {
                                                     snapshot,
                                                     &prompt_draft,
                                                 ),
-                                                28.0,
+                                                conversation_min_height,
                                                 Some(52.0),
                                                 window,
                                                 cx,
@@ -1445,9 +1480,9 @@ impl OperatorShell {
                                     ),
                                 ))
                                 .child(card(
-                                    "Active Turn Stream",
+                                    "Turn Activity",
                                     Some(
-                                        "Live Codex CLI updates while the current turn is running.",
+                                        "Supporting evidence for the current resident turn. The live reply text itself now stays in the main session lane.",
                                     ),
                                     document_surface(
                                         "operate-live-stream",
@@ -3263,7 +3298,7 @@ fn build_active_turn_stream_markdown(snapshot: &OperatorSnapshot) -> String {
         && snapshot.codex_cli_live_stream_events.is_empty()
         && snapshot.codex_cli_live_stream_warnings.is_empty()
     {
-        return "# Active Turn Stream\n\n- No live Codex CLI stream is active right now."
+        return "# Turn Activity\n\n- No live Codex CLI stream is active right now."
             .to_string();
     }
 
@@ -3282,12 +3317,11 @@ fn build_active_turn_stream_markdown(snapshot: &OperatorSnapshot) -> String {
     if let Some(objective) = snapshot.codex_cli_live_stream_objective.as_deref() {
         lines.push(format!("- **Objective:** {objective}"));
     }
-    let mut sections = vec![format!("# Active Turn Stream\n\n{}", lines.join("\n"))];
-    if let Some(text) = snapshot.codex_cli_live_stream_text.as_deref() {
-        if !text.trim().is_empty() {
-            sections.push(format!("## Active text\n\n{}", text.trim()));
-        }
-    }
+    let mut sections = vec![format!("# Turn Activity\n\n{}", lines.join("\n"))];
+    sections.push(
+        "## Session lane\n\n- Live reply text is shown directly in the main session workspace while Codex is responding."
+            .to_string(),
+    );
     if !snapshot.codex_cli_live_stream_events.is_empty() {
         sections.push(format!(
             "## Live events\n\n{}",
@@ -3688,11 +3722,21 @@ fn build_conversation_entries(
     prompt_draft: &str,
 ) -> Vec<ConversationEntry> {
     let mut entries = Vec::new();
-    let draft_entry = (!prompt_draft.trim().is_empty()).then(|| ConversationEntry {
+    let trimmed_draft = prompt_draft.trim();
+    let live_objective = snapshot
+        .codex_cli_live_stream_objective
+        .as_deref()
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty());
+    let draft_matches_live = snapshot.codex_cli_live_stream_active
+        && live_objective.is_some_and(|objective| objective == trimmed_draft);
+    let draft_entry = (!trimmed_draft.is_empty()).then(|| ConversationEntry {
         role: ConversationRole::User,
         title: "Draft prompt".to_string(),
-        body: prompt_draft.trim().to_string(),
+        body: trimmed_draft.to_string(),
         is_draft: true,
+        is_live: false,
+        footer_lines: Vec::new(),
     });
 
     match engine_mode {
@@ -3705,6 +3749,8 @@ fn build_conversation_entries(
                             "No provider reply has been recorded yet. Send a prompt to start the session."
                             .to_string(),
                     is_draft: false,
+                    is_live: false,
+                    footer_lines: Vec::new(),
                 });
             } else if snapshot.codex_cli_recent_turn_objectives.len()
                 == snapshot.codex_cli_recent_turn_replies.len()
@@ -3722,12 +3768,16 @@ fn build_conversation_entries(
                                     title: "Prompt".to_string(),
                                     body: objective.trim().to_string(),
                                     is_draft: false,
+                                    is_live: false,
+                                    footer_lines: Vec::new(),
                                 },
                                 ConversationEntry {
                                     role: ConversationRole::Assistant,
                                     title,
                                     body,
                                     is_draft: false,
+                                    is_live: false,
+                                    footer_lines: Vec::new(),
                                 },
                             ]
                         }),
@@ -3740,16 +3790,37 @@ fn build_conversation_entries(
                         title,
                         body,
                         is_draft: false,
+                        is_live: false,
+                        footer_lines: Vec::new(),
                     }
                 }));
             }
 
             if snapshot.codex_cli_live_stream_active {
+                if let Some(objective) = live_objective {
+                    let recent_user_matches = entries
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.role == ConversationRole::User)
+                        .is_some_and(|entry| entry.body.trim() == objective);
+                    if !recent_user_matches {
+                        entries.push(ConversationEntry {
+                            role: ConversationRole::User,
+                            title: "Current prompt".to_string(),
+                            body: objective.to_string(),
+                            is_draft: false,
+                            is_live: false,
+                            footer_lines: Vec::new(),
+                        });
+                    }
+                }
                 entries.push(ConversationEntry {
                     role: ConversationRole::Assistant,
-                    title: "Codex (live)".to_string(),
+                    title: "Codex is responding".to_string(),
                     body: build_live_stream_body(snapshot),
                     is_draft: false,
+                    is_live: true,
+                    footer_lines: build_live_stream_footer_lines(snapshot),
                 });
             }
         }
@@ -3763,6 +3834,8 @@ fn build_conversation_entries(
                             "No provider reply has been recorded yet. Send a prompt to start the session."
                             .to_string(),
                     is_draft: false,
+                    is_live: false,
+                    footer_lines: Vec::new(),
                 });
             } else {
                 entries.extend(replies.iter().map(|reply| {
@@ -3772,13 +3845,15 @@ fn build_conversation_entries(
                         title,
                         body,
                         is_draft: false,
+                        is_live: false,
+                        footer_lines: Vec::new(),
                     }
                 }));
             }
         }
     }
 
-    if let Some(draft_entry) = draft_entry {
+    if let Some(draft_entry) = draft_entry.filter(|_| !draft_matches_live) {
         entries.push(draft_entry);
     }
 
@@ -3786,38 +3861,33 @@ fn build_conversation_entries(
 }
 
 fn build_live_stream_body(snapshot: &OperatorSnapshot) -> String {
-    let mut sections = Vec::new();
     if let Some(text) = snapshot.codex_cli_live_stream_text.as_deref() {
         if !text.trim().is_empty() {
-            sections.push(text.trim().to_string());
+            return text.trim().to_string();
         }
     }
-    if sections.is_empty() {
-        sections.push("Codex is actively working on the current turn.".to_string());
+    "Codex is actively working on the current turn.".to_string()
+}
+
+fn build_live_stream_footer_lines(snapshot: &OperatorSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(updated_at) = snapshot.codex_cli_live_stream_updated_at {
+        lines.push(format!("Updated {}", updated_at.to_rfc3339()));
     }
-    if !snapshot.codex_cli_live_stream_events.is_empty() {
-        sections.push(format!(
-            "Recent live events:\n{}",
-            snapshot
-                .codex_cli_live_stream_events
-                .iter()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    if !snapshot.codex_cli_live_stream_warnings.is_empty() {
-        sections.push(format!(
-            "Warnings:\n{}",
-            snapshot
-                .codex_cli_live_stream_warnings
-                .iter()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    sections.join("\n\n")
+    lines.extend(
+        snapshot
+            .codex_cli_live_stream_events
+            .iter()
+            .take(3)
+            .map(|line| format!("Activity: {line}")),
+    );
+    lines.extend(
+        snapshot
+            .codex_cli_live_stream_warnings
+            .iter()
+            .map(|line| format!("Warning: {line}")),
+    );
+    lines
 }
 
 fn split_conversation_reply(reply: &str) -> (String, String) {

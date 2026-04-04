@@ -79,13 +79,18 @@ Completed in this slice:
    - regular `cargo test -p splcw-operator-gui` still passes
    - added an ignored real-transport probe that exercises `ResidentCodexTransport` directly against the installed logged-in Codex CLI app-server
    - that ignored probe passed locally, proving the resident transport is not just an abstraction sketch
+20. Re-centered the live resident turn around the main session lane:
+   - the Operate page now treats the resident reply stream as the primary conversation surface instead of duplicating it in a side diagnostic pane
+   - live turns now show a `Current prompt` user card followed by a `Codex is responding` assistant card with a clear streaming pill
+   - live event and warning lines now sit in compact footer metadata beneath the streaming reply instead of polluting the reply body itself
+   - the right-rail `Turn Activity` panel is now explicitly supporting evidence, not the main text surface
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
    - keep reducing the remaining stacked dashboard-card behavior
    - make the session lane more live and interactive beyond historical prompt/reply controls
-   - make the resident app-server live stream obvious and useful instead of a secondary debug pane
+   - keep deepening the resident app-server stream so it feels like a first-class conversation, not just a better live card
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift

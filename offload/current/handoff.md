@@ -72,15 +72,21 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - added an ignored real-transport probe:
     - `resident_transport::tests::resident_codex_transport_runs_real_app_server_turn`
   - that ignored probe passed locally against the installed logged-in Codex CLI app-server
+- newest live-session pass:
+  - the resident stream now leads the main conversation lane instead of being duplicated as the primary content of a side inspector card
+  - live turns now render as a `Current prompt` user card followed by a `Codex is responding` assistant card with a streaming status pill
+  - live event and warning details now appear as compact footer metadata under the streaming assistant card
+  - the former `Active Turn Stream` card is now a supporting `Turn Activity` inspector surface rather than a second competing transcript
 - important current boundary:
   - the resident app-server lane is now real
-  - but the GPUI shell still does not expose that live delta stream as naturally as OpenClaw / OpenCode yet
+  - the main session lane now foregrounds the live resident stream more naturally
+  - but the overall transcript/composer rhythm still does not yet feel as naturally polished as OpenClaw / OpenCode
 
 ## Immediate Next Action
 
 Make the CLI-first operator path genuinely humane:
 
 1. keep reshaping the shell toward transcript/composer/proof workbench behavior until it feels like a real agent client instead of a dashboard
-2. make the resident app-server live delta stream feel first-class in the session workspace instead of diagnostic
+2. deepen the live resident stream interaction so it feels like active typing/progression, not just better live cards
 3. reduce or properly contextualize the remaining Codex-local warnings (`state_5.sqlite` migration drift and PowerShell shell snapshot warnings)
 4. decide whether anything beyond the current `app-server` resident lane is still needed for truly first-class live text behavior
