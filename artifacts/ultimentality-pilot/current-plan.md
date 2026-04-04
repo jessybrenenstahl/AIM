@@ -84,6 +84,10 @@ Completed in this slice:
    - live turns now show a `Current prompt` user card followed by a `Codex is responding` assistant card with a clear streaming pill
    - live event and warning lines now sit in compact footer metadata beneath the streaming reply instead of polluting the reply body itself
    - the right-rail `Turn Activity` panel is now explicitly supporting evidence, not the main text surface
+21. Cleaned the session lane so historical Codex replies read like conversation instead of telemetry:
+   - stored CLI reply cards now strip engine/session header bullets out of the main body and move them into compact footer metadata
+   - raw `## CLI Warnings` sections are no longer dumped into the main conversation body
+   - live resident cards now summarize warning presence instead of flooding the transcript with Codex-local warning text
 
 ### Immediate Next Work
 
@@ -91,6 +95,7 @@ Completed in this slice:
    - keep reducing the remaining stacked dashboard-card behavior
    - make the session lane more live and interactive beyond historical prompt/reply controls
    - keep deepening the resident app-server stream so it feels like a first-class conversation, not just a better live card
+   - continue separating proof/telemetry from reply content so the transcript stays humane under long-running use
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift

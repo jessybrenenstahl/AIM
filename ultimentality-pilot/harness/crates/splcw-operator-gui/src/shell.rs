@@ -42,6 +42,12 @@ struct ConversationEntry {
     footer_lines: Vec<String>,
 }
 
+struct ParsedConversationReply {
+    title: String,
+    body: String,
+    footer_lines: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConversationRole {
     User,
@@ -3761,7 +3767,7 @@ fn build_conversation_entries(
                         .iter()
                         .zip(snapshot.codex_cli_recent_turn_replies.iter())
                         .flat_map(|(objective, reply)| {
-                            let (title, body) = split_conversation_reply(reply);
+                            let parsed = parse_conversation_reply(reply);
                             [
                                 ConversationEntry {
                                     role: ConversationRole::User,
@@ -3773,25 +3779,25 @@ fn build_conversation_entries(
                                 },
                                 ConversationEntry {
                                     role: ConversationRole::Assistant,
-                                    title,
-                                    body,
+                                    title: parsed.title,
+                                    body: parsed.body,
                                     is_draft: false,
                                     is_live: false,
-                                    footer_lines: Vec::new(),
+                                    footer_lines: parsed.footer_lines,
                                 },
                             ]
                         }),
                 );
             } else {
                 entries.extend(snapshot.codex_cli_recent_turn_replies.iter().map(|reply| {
-                    let (title, body) = split_conversation_reply(reply);
+                    let parsed = parse_conversation_reply(reply);
                     ConversationEntry {
                         role: ConversationRole::Assistant,
-                        title,
-                        body,
+                        title: parsed.title,
+                        body: parsed.body,
                         is_draft: false,
                         is_live: false,
-                        footer_lines: Vec::new(),
+                        footer_lines: parsed.footer_lines,
                     }
                 }));
             }
@@ -3839,14 +3845,14 @@ fn build_conversation_entries(
                 });
             } else {
                 entries.extend(replies.iter().map(|reply| {
-                    let (title, body) = split_conversation_reply(reply);
+                    let parsed = parse_conversation_reply(reply);
                     ConversationEntry {
                         role: ConversationRole::Assistant,
-                        title,
-                        body,
+                        title: parsed.title,
+                        body: parsed.body,
                         is_draft: false,
                         is_live: false,
-                        footer_lines: Vec::new(),
+                        footer_lines: parsed.footer_lines,
                     }
                 }));
             }
@@ -3871,50 +3877,76 @@ fn build_live_stream_body(snapshot: &OperatorSnapshot) -> String {
 
 fn build_live_stream_footer_lines(snapshot: &OperatorSnapshot) -> Vec<String> {
     let mut lines = Vec::new();
+    lines.push("Receiving live deltas from the resident Codex app-server.".to_string());
     if let Some(updated_at) = snapshot.codex_cli_live_stream_updated_at {
         lines.push(format!("Updated {}", updated_at.to_rfc3339()));
     }
-    lines.extend(
-        snapshot
-            .codex_cli_live_stream_events
-            .iter()
-            .take(3)
-            .map(|line| format!("Activity: {line}")),
-    );
-    lines.extend(
-        snapshot
-            .codex_cli_live_stream_warnings
-            .iter()
-            .map(|line| format!("Warning: {line}")),
-    );
+    if let Some(event) = snapshot.codex_cli_live_stream_events.last() {
+        lines.push(format!("Latest activity: {event}"));
+    }
+    if !snapshot.codex_cli_live_stream_warnings.is_empty() {
+        lines.push(format!(
+            "{} Codex-local warning(s) hidden from the session lane. See Turn Activity for details.",
+            snapshot.codex_cli_live_stream_warnings.len()
+        ));
+    }
     lines
 }
 
-fn split_conversation_reply(reply: &str) -> (String, String) {
+fn parse_conversation_reply(reply: &str) -> ParsedConversationReply {
     let trimmed = reply.trim();
+    let mut title = "Codex reply".to_string();
+    let mut body = if trimmed.is_empty() {
+        "Reply body is empty.".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let mut footer_lines = Vec::new();
+
     if let Some(rest) = trimmed.strip_prefix("# ") {
-        if let Some((title, body)) = rest.split_once('\n') {
-            let body = body.trim();
-            return (
-                title.trim().to_string(),
-                if body.is_empty() {
-                    "Reply body is empty.".to_string()
-                } else {
-                    body.to_string()
-                },
-            );
+        if let Some((heading, remainder)) = rest.split_once('\n') {
+            title = heading.trim().to_string();
+            body = remainder.trim().to_string();
+        } else {
+            title = rest.trim().to_string();
+            body = "Reply body is empty.".to_string();
         }
-        return (rest.trim().to_string(), "Reply body is empty.".to_string());
     }
 
-    (
-        "Codex reply".to_string(),
-        if trimmed.is_empty() {
-            "Reply body is empty.".to_string()
-        } else {
-            trimmed.to_string()
-        },
-    )
+    if let Some((header_block, after_response)) = body.split_once("## Response Content") {
+        footer_lines.extend(
+            header_block
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("- **"))
+                .map(|line| line.trim_start_matches("- ").to_string()),
+        );
+        body = after_response.trim().to_string();
+    }
+
+    if let Some((content, warnings_block)) = body.split_once("## CLI Warnings") {
+        let warning_count = warnings_block
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("- "))
+            .count();
+        if warning_count > 0 {
+            footer_lines.push(format!(
+                "{warning_count} Codex-local warning(s) hidden from the session lane."
+            ));
+        }
+        body = content.trim().to_string();
+    }
+
+    if body.is_empty() {
+        body = "Reply body is empty.".to_string();
+    }
+
+    ParsedConversationReply {
+        title,
+        body,
+        footer_lines,
+    }
 }
 
 fn build_recent_replies_markdown(

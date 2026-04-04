@@ -77,10 +77,15 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - live turns now render as a `Current prompt` user card followed by a `Codex is responding` assistant card with a streaming status pill
   - live event and warning details now appear as compact footer metadata under the streaming assistant card
   - the former `Active Turn Stream` card is now a supporting `Turn Activity` inspector surface rather than a second competing transcript
+- newest transcript hygiene pass:
+  - historical Codex reply cards now strip engine/model/session bullets out of the main body and keep them as compact footer metadata
+  - raw `## CLI Warnings` sections are no longer dumped into the main session lane
+  - live resident cards now summarize warning presence instead of flooding the transcript with Codex-local warning text
 - important current boundary:
   - the resident app-server lane is now real
   - the main session lane now foregrounds the live resident stream more naturally
   - but the overall transcript/composer rhythm still does not yet feel as naturally polished as OpenClaw / OpenCode
+  - and warning handling still needs a more productized strategy than summary text plus a diagnostic inspector
 
 ## Immediate Next Action
 
