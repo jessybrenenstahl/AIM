@@ -26,16 +26,20 @@ use splcw_llm::{
 };
 use splcw_memory::{FilesystemOffloadSink, SqliteStateStore};
 use splcw_orchestrator::{
-    OrchestratorState, PersistentOrchestrator, RuntimePendingTurnCheckpoint, RuntimeSessionEvent,
-    RuntimeSessionState, RuntimeTurnOptions, RuntimeTurnRecord, SupervisedGithubActionKind,
-    SupervisedGithubActionRequest,
+    AlwaysOnMemory, OrchestratorState, PersistentOrchestrator, ResidentSession,
+    ResidentSessionEvent, RuntimePendingTurnCheckpoint, RuntimeSessionEvent, RuntimeSessionState,
+    RuntimeTurnOptions, RuntimeTurnRecord, SupervisedGithubActionKind,
+    SupervisedGithubActionRequest, create_resident_session_channel,
 };
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::runtime::Builder;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod shell;
+mod resident_transport;
 
+use resident_transport::ResidentCodexTransport;
 use shell::{OperatorShell, init as init_operator_shell};
 
 const DEFAULT_MODEL: &str = "gpt-5.4";
@@ -499,6 +503,11 @@ struct CapturedCommandOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+struct CodexCliTurnExecution {
+    reply: String,
+    summary: String,
 }
 
 struct BackgroundRunnerRead {
@@ -1273,112 +1282,20 @@ impl HarnessController {
         &self,
         settings: &RunSettings,
     ) -> anyhow::Result<OperatorTurnResult> {
-        let cli_status = codex_cli_status(&self.paths);
-        if !cli_status.available {
-            anyhow::bail!(cli_status.summary);
-        }
-        if !cli_status.logged_in {
-            anyhow::bail!(
-                "Codex CLI is installed but not logged in yet. Use the Auth page to launch `codex login` first."
-            );
-        }
-        let command_path = cli_status
-            .command_path
-            .as_ref()
-            .context("Codex CLI command path was not recorded")?;
-        let session_dir = self.paths.session_root.join(&self.paths.session_id);
-        fs::create_dir_all(&session_dir)
-            .with_context(|| format!("create session dir {}", session_dir.display()))?;
-        let grounding_bundle = build_runtime_grounding_bundle(&self.paths)?;
-        let prompt =
-            build_codex_cli_context_prompt(&self.paths, settings.objective.as_str(), grounding_bundle.as_deref());
-        let previous_session =
-            read_json_file::<CodexCliSessionState>(self.paths.codex_cli_session_path.clone())?;
-        let args = if let Some(previous_session) = previous_session.as_ref() {
-            vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                "--json".to_string(),
-                "-m".to_string(),
-                normalize_text(&settings.model, DEFAULT_MODEL),
-                previous_session.session_id.clone(),
-                "-".to_string(),
-            ]
-        } else {
-            vec![
-                "exec".to_string(),
-                "--json".to_string(),
-                "--color".to_string(),
-                "never".to_string(),
-                "-m".to_string(),
-                normalize_text(&settings.model, DEFAULT_MODEL),
-                "-C".to_string(),
-                self.paths.repo_root.display().to_string(),
-                "-".to_string(),
-            ]
-        };
-        let output = run_command_stream_with_stdin(
-            command_path,
-            &self.paths.repo_root,
-            &args,
-            prompt.as_bytes(),
-            &self.paths.codex_cli_live_stream_path,
-            settings.objective.as_str(),
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let parsed = parse_codex_cli_exec_output(&stdout, &stderr);
-        let session_id = parsed.session_id.clone().or_else(|| {
-            previous_session
-                .as_ref()
-                .map(|state| state.session_id.clone())
+        let grounding_bundle = build_runtime_grounding_bundle(&self.paths)?.unwrap_or_else(|| {
+            "Grounding bundle unavailable. Rehydrate manually from AIM memory and continuity artifacts before acting."
+                .to_string()
         });
-        if let Some(session_id) = session_id.as_ref() {
-            write_json_atomic(
-                &self.paths.codex_cli_session_path,
-                &CodexCliSessionState {
-                    session_id: session_id.clone(),
-                    updated_at: Utc::now(),
-                    model: normalize_text(&settings.model, DEFAULT_MODEL),
-                },
-            )?;
-        }
-        let warning_lines = parsed.warning_lines.clone();
-        let summary = if !warning_lines.is_empty() {
-            format!(
-                "{} | warning: {}",
-                parsed.summary,
-                truncate_for_summary(&warning_lines[0], 120)
-            )
-        } else {
-            parsed.summary.clone()
-        };
-        append_jsonl_entry(
-            &session_dir.join("codex-cli-turn-log.jsonl"),
-            &CodexCliTurnRecord {
-                recorded_at: Utc::now(),
-                session_id,
-                model: normalize_text(&settings.model, DEFAULT_MODEL),
-                objective: normalize_text(&settings.objective, DEFAULT_OBJECTIVE),
-                reply: parsed.reply.clone(),
-                summary: summary.clone(),
-                event_lines: parsed.event_lines,
-                warning_lines,
-            },
+        let execution = execute_codex_cli_turn(
+            &self.paths,
+            settings,
+            settings.objective.as_str(),
+            grounding_bundle.as_str(),
+            None,
         )?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "Codex CLI turn failed: {}",
-                if parsed.reply.trim().is_empty() {
-                    stderr.trim()
-                } else {
-                    parsed.reply.trim()
-                }
-            );
-        }
         Ok(OperatorTurnResult {
             terminal: OperatorTurnTerminal::Completed,
-            summary: format!("Codex CLI: {summary}"),
+            summary: format!("Codex CLI: {}", execution.summary),
         })
     }
 
@@ -1999,12 +1916,86 @@ struct OperatorApp {
     auth_callback_input: String,
     github_target_input: String,
     snapshot: Arc<Mutex<OperatorSnapshot>>,
+    resident_event_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ResidentSessionEvent>>>>,
     running: Arc<AtomicBool>,
     loop_requested: Arc<AtomicBool>,
     refreshing: Arc<AtomicBool>,
     auth_working: Arc<AtomicBool>,
     loop_pause_seconds: f32,
     last_refresh: Instant,
+}
+
+fn apply_resident_session_event(snapshot: &mut OperatorSnapshot, event: ResidentSessionEvent) {
+    snapshot.codex_cli_live_stream_updated_at = Some(Utc::now());
+    match event {
+        ResidentSessionEvent::StreamStart { .. } => {
+            snapshot.codex_cli_live_stream_active = true;
+            snapshot.codex_cli_live_stream_text = Some(String::new());
+            snapshot.codex_cli_live_stream_events.clear();
+            snapshot.codex_cli_live_stream_warnings.clear();
+        }
+        ResidentSessionEvent::Chunk { delta } => {
+            snapshot.codex_cli_live_stream_active = true;
+            let text = snapshot
+                .codex_cli_live_stream_text
+                .get_or_insert_with(String::new);
+            text.push_str(&delta);
+        }
+        ResidentSessionEvent::ToolUse { tool, input } => {
+            snapshot.codex_cli_live_stream_active = true;
+            append_limited(
+                &mut snapshot.codex_cli_live_stream_events,
+                format!(
+                    "tool_use {}",
+                    truncate_for_summary(&format!("{tool} {input}"), 140)
+                ),
+                RECENT_LIVE_STREAM_LINE_LIMIT,
+            );
+        }
+        ResidentSessionEvent::ToolResult { output } => {
+            snapshot.codex_cli_live_stream_active = true;
+            append_limited(
+                &mut snapshot.codex_cli_live_stream_events,
+                format!("tool_result {}", truncate_for_summary(&output, 140)),
+                RECENT_LIVE_STREAM_LINE_LIMIT,
+            );
+        }
+        ResidentSessionEvent::ResponseDone { full_response } => {
+            snapshot.codex_cli_live_stream_active = false;
+            snapshot.codex_cli_last_turn_reply = Some(full_response.clone());
+            snapshot.codex_cli_last_turn_summary = Some(summarize_codex_cli_reply(&full_response));
+            if snapshot
+                .codex_cli_recent_turn_replies
+                .last()
+                .map(|reply| reply.trim() != full_response.trim())
+                .unwrap_or(true)
+            {
+                append_limited(
+                    &mut snapshot.codex_cli_recent_turn_replies,
+                    full_response,
+                    RECENT_TURN_LIMIT,
+                );
+            }
+        }
+        ResidentSessionEvent::GapDetected { gap } => {
+            snapshot.codex_cli_live_stream_active = false;
+            append_limited(
+                &mut snapshot.codex_cli_live_stream_events,
+                format!("gap {} -> {}", gap.title, gap.permanent_fix_target),
+                RECENT_LIVE_STREAM_LINE_LIMIT,
+            );
+        }
+        ResidentSessionEvent::ContradictionDetected { contradiction } => {
+            append_limited(
+                &mut snapshot.codex_cli_live_stream_warnings,
+                contradiction,
+                RECENT_LIVE_STREAM_LINE_LIMIT,
+            );
+        }
+        ResidentSessionEvent::TurnComplete { .. } => {
+            snapshot.codex_cli_live_stream_active = false;
+        }
+    }
 }
 
 impl OperatorApp {
@@ -2025,12 +2016,37 @@ impl OperatorApp {
                 summary: "operator ready".into(),
                 ..OperatorSnapshot::default()
             })),
+            resident_event_rx: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             loop_requested: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             auth_working: Arc::new(AtomicBool::new(false)),
             loop_pause_seconds: DEFAULT_LOOP_PAUSE_SECONDS,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
+        }
+    }
+
+    fn install_resident_event_receiver(
+        &self,
+        receiver: mpsc::UnboundedReceiver<ResidentSessionEvent>,
+    ) {
+        *self
+            .resident_event_rx
+            .lock()
+            .expect("resident event receiver poisoned") = Some(receiver);
+    }
+
+    fn drain_resident_events(&self) {
+        let mut receiver_guard = self
+            .resident_event_rx
+            .lock()
+            .expect("resident event receiver poisoned");
+        let Some(receiver) = receiver_guard.as_mut() else {
+            return;
+        };
+        let mut snapshot = self.snapshot.lock().expect("operator snapshot poisoned");
+        while let Ok(event) = receiver.try_recv() {
+            apply_resident_session_event(&mut snapshot, event);
         }
     }
 
@@ -2147,6 +2163,131 @@ impl OperatorApp {
         let refreshing = self.refreshing.clone();
         let settings = self.settings.clone();
         let pause_duration = Duration::from_secs_f32(self.loop_pause_seconds.max(0.0));
+        if settings.engine_mode == OperatorEngineMode::CodexCli {
+            let (event_tx, event_rx) = create_resident_session_channel();
+            self.install_resident_event_receiver(event_rx);
+            std::thread::spawn(move || {
+                let memory = match build_operator_always_on_memory(&controller.paths) {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        let next = OperatorSnapshot {
+                            refreshed_at: Some(Utc::now()),
+                            run_state: "idle".into(),
+                            run_mode: OperatorRunMode::Idle.as_label().into(),
+                            summary: "resident session startup failed".into(),
+                            last_error: Some(format!("{error:#}")),
+                            ..OperatorSnapshot::default()
+                        };
+                        *snapshot.lock().expect("operator snapshot poisoned") = next;
+                        running.store(false, Ordering::SeqCst);
+                        loop_flag.store(false, Ordering::SeqCst);
+                        refreshing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let plan = build_initial_operator_plan(settings.objective.clone()).plan;
+                let transport = Arc::new(ResidentCodexTransport::new(
+                    controller.paths.clone(),
+                    settings.clone(),
+                ));
+                let mut session =
+                    ResidentSession::new_with_transport(plan, memory, event_tx, transport);
+                let mut completed_turn_count = 0_u64;
+
+                loop {
+                    let objective = settings.objective.clone();
+                    let turn_result =
+                        run_async(|| async { session.run_turn(&objective).await.map(|_| ()) });
+                    match turn_result {
+                        Ok(()) => {
+                            completed_turn_count += 1;
+                            let should_continue = matches!(run_mode, OperatorRunMode::Continuous)
+                                && loop_flag.load(Ordering::SeqCst)
+                                && sleep_while_requested(&loop_flag, pause_duration);
+                            let summary = if should_continue {
+                                format!(
+                                    "resident Codex CLI turn {} completed | next turn in {:.1}s",
+                                    completed_turn_count,
+                                    pause_duration.as_secs_f32()
+                                )
+                            } else if matches!(run_mode, OperatorRunMode::Continuous) {
+                                format!(
+                                    "resident Codex CLI loop stopped after {} turn(s)",
+                                    completed_turn_count
+                                )
+                            } else {
+                                "resident Codex CLI turn completed".to_string()
+                            };
+                            let controller_for_snapshot = controller.clone();
+                            let summary_for_snapshot = summary.clone();
+                            let run_state = if should_continue { "looping" } else { "idle" };
+                            let run_mode_for_snapshot = if should_continue {
+                                OperatorRunMode::Continuous
+                            } else {
+                                OperatorRunMode::Idle
+                            };
+                            let next = run_async(move || async move {
+                                controller_for_snapshot
+                                    .read_snapshot(
+                                        run_state,
+                                        run_mode_for_snapshot,
+                                        &summary_for_snapshot,
+                                        None,
+                                        completed_turn_count,
+                                        None,
+                                    )
+                                    .await
+                            })
+                            .unwrap_or(OperatorSnapshot {
+                                refreshed_at: Some(Utc::now()),
+                                run_state: run_state.into(),
+                                run_mode: run_mode_for_snapshot.as_label().into(),
+                                summary,
+                                completed_turn_count,
+                                ..OperatorSnapshot::default()
+                            });
+                            *snapshot.lock().expect("operator snapshot poisoned") = next;
+                            if should_continue {
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            let last_error = Some(format!("{error:#}"));
+                            let controller_for_snapshot = controller.clone();
+                            let last_error_for_snapshot = last_error.clone();
+                            let next = run_async(move || async move {
+                                controller_for_snapshot
+                                    .read_snapshot(
+                                        "idle",
+                                        OperatorRunMode::Idle,
+                                        "resident Codex CLI turn failed",
+                                        last_error_for_snapshot,
+                                        completed_turn_count,
+                                        None,
+                                    )
+                                    .await
+                            })
+                            .unwrap_or(OperatorSnapshot {
+                                refreshed_at: Some(Utc::now()),
+                                run_state: "idle".into(),
+                                run_mode: OperatorRunMode::Idle.as_label().into(),
+                                summary: "resident Codex CLI turn failed".into(),
+                                last_error,
+                                completed_turn_count,
+                                ..OperatorSnapshot::default()
+                            });
+                            *snapshot.lock().expect("operator snapshot poisoned") = next;
+                            break;
+                        }
+                    }
+                }
+                running.store(false, Ordering::SeqCst);
+                loop_flag.store(false, Ordering::SeqCst);
+                refreshing.store(false, Ordering::SeqCst);
+            });
+            return;
+        }
         std::thread::spawn(move || {
             let mut completed_turn_count = 0_u64;
             loop {
@@ -5500,6 +5641,7 @@ fn run_command_stream_with_stdin(
     stdin_bytes: &[u8],
     live_stream_path: &Path,
     objective: &str,
+    resident_events: Option<mpsc::UnboundedSender<ResidentSessionEvent>>,
 ) -> anyhow::Result<CapturedCommandOutput> {
     let mut child = build_output_command(command_path, cwd, args)
         .stdin(Stdio::piped())
@@ -5546,6 +5688,7 @@ fn run_command_stream_with_stdin(
 
     let stdout_state = Arc::clone(&live_state);
     let stdout_path = live_stream_path.to_path_buf();
+    let stdout_events = resident_events.clone();
     let stdout_handle = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
         let mut reader = BufReader::new(stdout);
         let mut buffer = Vec::new();
@@ -5557,13 +5700,19 @@ fn run_command_stream_with_stdin(
                 break;
             }
             buffer.extend_from_slice(line.as_bytes());
-            update_codex_cli_live_stream_from_stdout_line(&stdout_state, &stdout_path, &line);
+            update_codex_cli_live_stream_from_stdout_line(
+                &stdout_state,
+                &stdout_path,
+                &line,
+                stdout_events.as_ref(),
+            );
         }
         Ok(buffer)
     });
 
     let stderr_state = Arc::clone(&live_state);
     let stderr_path = live_stream_path.to_path_buf();
+    let stderr_events = resident_events;
     let stderr_handle = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
         let mut reader = BufReader::new(stderr);
         let mut buffer = Vec::new();
@@ -5575,7 +5724,12 @@ fn run_command_stream_with_stdin(
                 break;
             }
             buffer.extend_from_slice(line.as_bytes());
-            update_codex_cli_live_stream_from_stderr_line(&stderr_state, &stderr_path, &line);
+            update_codex_cli_live_stream_from_stderr_line(
+                &stderr_state,
+                &stderr_path,
+                &line,
+                stderr_events.as_ref(),
+            );
         }
         Ok(buffer)
     });
@@ -5636,6 +5790,205 @@ fn append_grounding_section(
         }
     }
     Ok(())
+}
+
+fn append_memory_section(
+    memory: &mut AlwaysOnMemory,
+    label: &str,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    if let Some(body) = read_text_if_exists(path.clone())? {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            memory.insert_section(
+                label,
+                format!("source: {}\n\n{}", path.display(), trimmed),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn build_operator_always_on_memory(paths: &OperatorPaths) -> anyhow::Result<AlwaysOnMemory> {
+    let mut memory = AlwaysOnMemory::new();
+
+    append_memory_section(
+        &mut memory,
+        "Operating System Context",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("memory")
+            .join("os.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Working Memory",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("memory")
+            .join("memory.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Baseline Recovery Context",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("baseline")
+            .join("clean-splcw-harness-2026-04-03.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Current Plan",
+        paths.repo_root
+            .join("artifacts")
+            .join("ultimentality-pilot")
+            .join("current-plan.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Current Brief",
+        paths.repo_root.join("offload").join("current").join("brief.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Current Plan Mirror",
+        paths.repo_root.join("offload").join("current").join("plan.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Current Open Gaps",
+        paths.repo_root.join("offload").join("current").join("open-gaps.md"),
+    )?;
+    append_memory_section(
+        &mut memory,
+        "Current Handoff",
+        paths.repo_root.join("offload").join("current").join("handoff.md"),
+    )?;
+
+    if let Some(repo_context) = build_repo_git_context(paths) {
+        memory.insert_section("Live Repo Context", repo_context);
+    }
+    if let Some(github_context) = build_github_cli_context(paths) {
+        memory.insert_section("Live GitHub Context", github_context);
+    }
+
+    Ok(memory)
+}
+
+fn execute_codex_cli_turn(
+    paths: &OperatorPaths,
+    settings: &RunSettings,
+    objective: &str,
+    grounding: &str,
+    resident_events: Option<mpsc::UnboundedSender<ResidentSessionEvent>>,
+) -> anyhow::Result<CodexCliTurnExecution> {
+    let cli_status = codex_cli_status(paths);
+    if !cli_status.available {
+        anyhow::bail!(cli_status.summary);
+    }
+    if !cli_status.logged_in {
+        anyhow::bail!(
+            "Codex CLI is installed but not logged in yet. Use the Auth page to launch `codex login` first."
+        );
+    }
+    let command_path = cli_status
+        .command_path
+        .as_ref()
+        .context("Codex CLI command path was not recorded")?;
+    let session_dir = paths.session_root.join(&paths.session_id);
+    fs::create_dir_all(&session_dir)
+        .with_context(|| format!("create session dir {}", session_dir.display()))?;
+    let prompt = build_codex_cli_context_prompt(paths, objective, Some(grounding));
+    let previous_session = read_json_file::<CodexCliSessionState>(paths.codex_cli_session_path.clone())?;
+    let args = if let Some(previous_session) = previous_session.as_ref() {
+        vec![
+            "exec".to_string(),
+            "resume".to_string(),
+            "--json".to_string(),
+            "-m".to_string(),
+            normalize_text(&settings.model, DEFAULT_MODEL),
+            previous_session.session_id.clone(),
+            "-".to_string(),
+        ]
+    } else {
+        vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "-m".to_string(),
+            normalize_text(&settings.model, DEFAULT_MODEL),
+            "-C".to_string(),
+            paths.repo_root.display().to_string(),
+            "-".to_string(),
+        ]
+    };
+    let output = run_command_stream_with_stdin(
+        command_path,
+        &paths.repo_root,
+        &args,
+        prompt.as_bytes(),
+        &paths.codex_cli_live_stream_path,
+        objective,
+        resident_events,
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed = parse_codex_cli_exec_output(&stdout, &stderr);
+    let session_id = parsed
+        .session_id
+        .clone()
+        .or_else(|| previous_session.as_ref().map(|state| state.session_id.clone()));
+    if let Some(session_id) = session_id.as_ref() {
+        write_json_atomic(
+            &paths.codex_cli_session_path,
+            &CodexCliSessionState {
+                session_id: session_id.clone(),
+                updated_at: Utc::now(),
+                model: normalize_text(&settings.model, DEFAULT_MODEL),
+            },
+        )?;
+    }
+    let warning_lines = parsed.warning_lines.clone();
+    let summary = if !warning_lines.is_empty() {
+        format!(
+            "{} | warning: {}",
+            parsed.summary,
+            truncate_for_summary(&warning_lines[0], 120)
+        )
+    } else {
+        parsed.summary.clone()
+    };
+    append_jsonl_entry(
+        &session_dir.join("codex-cli-turn-log.jsonl"),
+        &CodexCliTurnRecord {
+            recorded_at: Utc::now(),
+            session_id: session_id.clone(),
+            model: normalize_text(&settings.model, DEFAULT_MODEL),
+            objective: normalize_text(objective, DEFAULT_OBJECTIVE),
+            reply: parsed.reply.clone(),
+            summary: summary.clone(),
+            event_lines: parsed.event_lines.clone(),
+            warning_lines: warning_lines.clone(),
+        },
+    )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Codex CLI turn failed: {}",
+            if parsed.reply.trim().is_empty() {
+                stderr.trim()
+            } else {
+                parsed.reply.trim()
+            }
+        );
+    }
+    Ok(CodexCliTurnExecution {
+        reply: parsed.reply,
+        summary,
+    })
 }
 
 fn build_runtime_grounding_bundle(paths: &OperatorPaths) -> anyhow::Result<Option<String>> {
@@ -5842,6 +6195,60 @@ fn format_codex_cli_event_line(event: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn emit_resident_events_from_codex_event(
+    events: &mpsc::UnboundedSender<ResidentSessionEvent>,
+    event: &serde_json::Value,
+) {
+    if let Some(update) = codex_cli_text_update_from_event(event) {
+        let delta = match update {
+            CodexCliTextUpdate::Replace(text) => text,
+            CodexCliTextUpdate::Append(text) => text,
+        };
+        if !delta.trim().is_empty() {
+            let _ = events.send(ResidentSessionEvent::Chunk { delta });
+        }
+    }
+
+    let Some(event_type) = event.get("type").and_then(|value| value.as_str()) else {
+        return;
+    };
+
+    match event_type {
+        "item.started" => {
+            let item = event.get("item").cloned().unwrap_or_default();
+            if item.get("type").and_then(|value| value.as_str()) == Some("command_execution") {
+                let tool = item
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("command_execution")
+                    .to_string();
+                let input = item.to_string();
+                let _ = events.send(ResidentSessionEvent::ToolUse { tool, input });
+            }
+        }
+        "item.completed" => {
+            let item = event.get("item").cloned().unwrap_or_default();
+            match item.get("type").and_then(|value| value.as_str()) {
+                Some("command_execution") => {
+                    let output = item.to_string();
+                    let _ = events.send(ResidentSessionEvent::ToolResult { output });
+                }
+                Some("agent_message") => {
+                    if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                        if !text.trim().is_empty() {
+                            let _ = events.send(ResidentSessionEvent::ResponseDone {
+                                full_response: text.to_string(),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 fn parse_codex_cli_exec_output(stdout: &str, stderr: &str) -> ParsedCodexCliExecOutput {
     let mut session_id = None;
     let mut replies = Vec::new();
@@ -5900,6 +6307,7 @@ fn update_codex_cli_live_stream_from_stdout_line(
     state: &Arc<Mutex<CodexCliLiveStreamState>>,
     live_stream_path: &Path,
     line: &str,
+    resident_events: Option<&mpsc::UnboundedSender<ResidentSessionEvent>>,
 ) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -5927,6 +6335,9 @@ fn update_codex_cli_live_stream_from_stdout_line(
                         RECENT_LIVE_STREAM_LINE_LIMIT,
                     );
                 }
+                if let Some(events) = resident_events {
+                    emit_resident_events_from_codex_event(events, &event);
+                }
                 if let Some(update) = codex_cli_text_update_from_event(&event) {
                     match update {
                         CodexCliTextUpdate::Replace(text) => stream.latest_text = text,
@@ -5949,6 +6360,7 @@ fn update_codex_cli_live_stream_from_stderr_line(
     state: &Arc<Mutex<CodexCliLiveStreamState>>,
     live_stream_path: &Path,
     line: &str,
+    resident_events: Option<&mpsc::UnboundedSender<ResidentSessionEvent>>,
 ) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -5964,6 +6376,11 @@ fn update_codex_cli_live_stream_from_stderr_line(
         );
         stream.clone()
     };
+    if let Some(events) = resident_events {
+        let _ = events.send(ResidentSessionEvent::ContradictionDetected {
+            contradiction: trimmed.to_string(),
+        });
+    }
     let _ = write_json_atomic(live_stream_path, &snapshot);
 }
 

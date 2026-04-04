@@ -12,13 +12,18 @@ use anyhow::{Context, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splcw_computer_use::{ActionExecution, ObservationFrame, ProposedAction};
-use splcw_core::Receipt;
+use splcw_core::{CapabilityGap, Receipt, SplcwUnit, SufficientPlan};
 use splcw_llm::{ChatMessage, ChatRequest, ChatResponse, ContentBlock};
 use tokio::fs::{self, OpenOptions as TokioOpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+use crate::resident_transport::{
+    ResidentSessionEvent, ResidentSessionTransport, SimulatedResidentTransport,
+};
 
 static ACTIVE_SESSION_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
     OnceLock::new();
@@ -313,6 +318,165 @@ impl RuntimeTurnRecord {
 
         "turn recorded without tool outcome".into()
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlwaysOnMemory {
+    sections: BTreeMap<String, String>,
+    pub last_injected_at: Option<DateTime<Utc>>,
+}
+
+impl AlwaysOnMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_section(
+        mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        self.insert_section(title, body);
+        self
+    }
+
+    pub fn insert_section(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        let title = title.into();
+        let body = body.into();
+        if title.trim().is_empty() || body.trim().is_empty() {
+            return;
+        }
+        self.sections.insert(title, body);
+    }
+
+    pub fn build_grounding_context(&self) -> String {
+        self.sections
+            .iter()
+            .map(|(title, body)| format!("## {title}\n{body}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub fn inject_always_on(&mut self) {
+        self.last_injected_at = Some(Utc::now());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
+}
+
+pub struct ResidentSession {
+    pub session_id: String,
+    pub plan: SufficientPlan,
+    pub transcript: Vec<String>,
+    pub memory: AlwaysOnMemory,
+    pub events: mpsc::UnboundedSender<ResidentSessionEvent>,
+    pub start_time: std::time::SystemTime,
+    pub is_active: bool,
+    transport: std::sync::Arc<dyn ResidentSessionTransport>,
+}
+
+impl ResidentSession {
+    pub fn new(
+        plan: SufficientPlan,
+        memory: AlwaysOnMemory,
+        events: mpsc::UnboundedSender<ResidentSessionEvent>,
+    ) -> Self {
+        Self::new_with_transport(
+            plan,
+            memory,
+            events,
+            std::sync::Arc::new(SimulatedResidentTransport),
+        )
+    }
+
+    pub fn new_with_transport(
+        plan: SufficientPlan,
+        memory: AlwaysOnMemory,
+        events: mpsc::UnboundedSender<ResidentSessionEvent>,
+        transport: std::sync::Arc<dyn ResidentSessionTransport>,
+    ) -> Self {
+        Self {
+            session_id: format!("agro-session-{}", Uuid::new_v4()),
+            plan,
+            transcript: vec![],
+            memory,
+            events,
+            start_time: std::time::SystemTime::now(),
+            is_active: true,
+            transport,
+        }
+    }
+
+    pub async fn run_turn(&mut self, objective: &str) -> anyhow::Result<Receipt> {
+        let _ = self.events.send(ResidentSessionEvent::StreamStart {
+            session_id: self.session_id.clone(),
+        });
+
+        self.memory.inject_always_on();
+        let grounding = self.memory.build_grounding_context();
+        let response = self
+            .transport
+            .run_turn(&self.session_id, objective, &grounding, &self.events)
+            .await?;
+
+        self.transcript.push(format!("User: {objective}"));
+        self.transcript.push(format!("Assistant: {response}"));
+
+        let _ = self.events.send(ResidentSessionEvent::ResponseDone {
+            full_response: response.clone(),
+        });
+
+        let receipt = build_resident_success_receipt(&self.plan, objective, &response);
+        let _ = self.events.send(ResidentSessionEvent::TurnComplete {
+            receipt: receipt.clone(),
+        });
+
+        Ok(receipt)
+    }
+
+    pub fn inject_memory(&mut self) {
+        self.memory.inject_always_on();
+    }
+
+    pub fn record_gap(&self, gap: CapabilityGap) {
+        let _ = self.events.send(ResidentSessionEvent::GapDetected { gap });
+    }
+
+    pub fn record_contradiction(&self, contradiction: impl Into<String>) {
+        let _ = self
+            .events
+            .send(ResidentSessionEvent::ContradictionDetected {
+                contradiction: contradiction.into(),
+            });
+    }
+}
+
+fn build_resident_success_receipt(
+    plan: &SufficientPlan,
+    objective: &str,
+    response: &str,
+) -> Receipt {
+    Receipt {
+        id: Uuid::new_v4(),
+        plan_id: plan.id,
+        unit: SplcwUnit::Warden,
+        observed: "resident session turn completed".into(),
+        attempted: objective.to_string(),
+        changed: truncate_text(response, 240),
+        contradicted: None,
+        enabled_next: "Continue resident session with grounded state".into(),
+        recorded_at: Utc::now(),
+    }
+}
+
+fn truncate_text(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let truncated = value.chars().take(limit).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn default_foreground_thread_id() -> String {
@@ -2484,7 +2648,10 @@ fn clean_stale_lock_files(root: &Path, max_age_seconds: i64) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use splcw_core::{Invariant, PlanModule};
     use splcw_llm::{ChatMessage, ContentBlock};
+    use std::sync::{Arc, Mutex as StdMutex};
 
     fn temp_session_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2527,6 +2694,29 @@ mod tests {
 
     fn sample_turn_record(summary: &str) -> RuntimeTurnRecord {
         sample_turn_record_for_thread(summary, "main")
+    }
+
+    fn sample_plan() -> SufficientPlan {
+        SufficientPlan {
+            id: Uuid::new_v4(),
+            version: 1,
+            objective: "Make the resident session real".into(),
+            constraints: vec!["fail closed".into()],
+            invariants: vec![Invariant {
+                key: "session-native".into(),
+                description: "Keep session identity stable across turns".into(),
+            }],
+            modules: vec![PlanModule {
+                key: "resident-session".into(),
+                description: "Resident CLI/App-Server session transport".into(),
+                success_checks: vec!["stream live deltas".into(), "retain transcript".into()],
+                reveal_response: "Session substrate is stable".into(),
+            }],
+            active_module: "resident-session".into(),
+            recodification_rule: "Promote durable runtime improvements only after verification."
+                .into(),
+            updated_at: Utc::now(),
+        }
     }
 
     fn sample_pending_turn_checkpoint(
@@ -2617,6 +2807,118 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[derive(Default)]
+    struct CapturingResidentTransport {
+        seen_grounding: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ResidentSessionTransport for CapturingResidentTransport {
+        async fn run_turn(
+            &self,
+            session_id: &str,
+            objective: &str,
+            grounding: &str,
+            events: &mpsc::UnboundedSender<ResidentSessionEvent>,
+        ) -> anyhow::Result<String> {
+            self.seen_grounding
+                .lock()
+                .expect("grounding capture poisoned")
+                .push(grounding.to_string());
+            let _ = events.send(ResidentSessionEvent::ToolUse {
+                tool: "focus_window".into(),
+                input: "Codex".into(),
+            });
+            let _ = events.send(ResidentSessionEvent::ToolResult {
+                output: "focused Codex".into(),
+            });
+            let _ = events.send(ResidentSessionEvent::Chunk {
+                delta: "resident ".into(),
+            });
+            let _ = events.send(ResidentSessionEvent::Chunk {
+                delta: "reply".into(),
+            });
+            Ok(format!("resident reply for {objective} in {session_id}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_session_runs_turn_with_always_on_memory() {
+        let (tx, mut rx) = crate::create_resident_session_channel();
+        let transport = Arc::new(CapturingResidentTransport::default());
+        let mut session = ResidentSession::new_with_transport(
+            sample_plan(),
+            AlwaysOnMemory::new()
+                .with_section("Operating System", "Windows 11 desktop")
+                .with_section("Working Memory", "Use the Codex CLI workbench"),
+            tx,
+            transport.clone(),
+        );
+
+        let receipt = session.run_turn("Prove the session is grounded").await.unwrap();
+
+        assert_eq!(receipt.plan_id, session.plan.id);
+        assert_eq!(session.transcript.len(), 2);
+        assert!(session.transcript[0].contains("Prove the session is grounded"));
+        assert!(session.transcript[1].contains("resident reply"));
+        assert!(session.memory.last_injected_at.is_some());
+
+        let captured = transport
+            .seen_grounding
+            .lock()
+            .expect("grounding capture poisoned")
+            .clone();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains("## Operating System"));
+        assert!(captured[0].contains("## Working Memory"));
+
+        let mut saw_stream_start = false;
+        let mut saw_tool_use = false;
+        let mut saw_tool_result = false;
+        let mut saw_response_done = false;
+        let mut saw_turn_complete = false;
+
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ResidentSessionEvent::StreamStart { .. } => saw_stream_start = true,
+                ResidentSessionEvent::ToolUse { .. } => saw_tool_use = true,
+                ResidentSessionEvent::ToolResult { .. } => saw_tool_result = true,
+                ResidentSessionEvent::ResponseDone { full_response } => {
+                    saw_response_done = true;
+                    assert!(full_response.contains("resident reply"));
+                }
+                ResidentSessionEvent::TurnComplete { receipt } => {
+                    saw_turn_complete = true;
+                    assert_eq!(receipt.plan_id, session.plan.id);
+                }
+                ResidentSessionEvent::Chunk { .. }
+                | ResidentSessionEvent::GapDetected { .. }
+                | ResidentSessionEvent::ContradictionDetected { .. } => {}
+            }
+        }
+
+        assert!(saw_stream_start);
+        assert!(saw_tool_use);
+        assert!(saw_tool_result);
+        assert!(saw_response_done);
+        assert!(saw_turn_complete);
+    }
+
+    #[test]
+    fn always_on_memory_builds_stable_grounding_context() {
+        let mut memory = AlwaysOnMemory::new();
+        memory.insert_section("Working Memory", "Keep the runtime grounded.");
+        memory.insert_section("Operating System", "Windows 11");
+
+        let grounding = memory.build_grounding_context();
+
+        assert!(grounding.contains("## Operating System"));
+        assert!(grounding.contains("Windows 11"));
+        assert!(grounding.contains("## Working Memory"));
+        assert!(grounding.contains("Keep the runtime grounded."));
+        assert!(!memory.is_empty());
     }
 
     #[tokio::test]

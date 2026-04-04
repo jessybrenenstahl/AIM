@@ -55,13 +55,32 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - live warning/event lines during execution
   - final `agent_message` text once the CLI emits it
 - `status.json` now mirrors those live-stream fields so the GPUI shell can surface them directly on the Operate page
-- important current boundary: the present Codex CLI `exec --json` lane does not appear to emit token-by-token text deltas, so the active stream is truthful but still coarser than Codex App / OpenCode style live text streaming
+- resident session correction landed:
+  - `splcw-orchestrator` now exposes a dedicated resident transport module
+  - `splcw-operator-gui/src/resident_transport.rs` now owns a concrete `ResidentCodexTransport`
+  - that transport now runs a real `codex app-server --listen stdio://` process inside a dedicated resident worker thread
+  - the worker keeps the process and thread alive across turns instead of pretending `exec/resume` is the session runtime
+  - app-server notifications now feed the live session lane through:
+    - `thread/started`
+    - `turn/started`
+    - `item/agentMessage/delta`
+    - tool-like item lifecycle notifications
+    - `turn/completed`
+  - the old `exec --json` lane still exists as a fallback bridge if resident app-server startup or execution fails
+- verification update:
+  - `cargo test -p splcw-operator-gui` now passes with the resident transport extraction in place
+  - added an ignored real-transport probe:
+    - `resident_transport::tests::resident_codex_transport_runs_real_app_server_turn`
+  - that ignored probe passed locally against the installed logged-in Codex CLI app-server
+- important current boundary:
+  - the resident app-server lane is now real
+  - but the GPUI shell still does not expose that live delta stream as naturally as OpenClaw / OpenCode yet
 
 ## Immediate Next Action
 
 Make the CLI-first operator path genuinely humane:
 
 1. keep reshaping the shell toward transcript/composer/proof workbench behavior until it feels like a real agent client instead of a dashboard
-2. make the new active-turn stream feel first-class in the session workspace instead of diagnostic
+2. make the resident app-server live delta stream feel first-class in the session workspace instead of diagnostic
 3. reduce or properly contextualize the remaining Codex-local warnings (`state_5.sqlite` migration drift and PowerShell shell snapshot warnings)
-4. decide whether true continuously updating reply text requires a resident interactive CLI/PTTY lane beyond `exec --json`
+4. decide whether anything beyond the current `app-server` resident lane is still needed for truly first-class live text behavior

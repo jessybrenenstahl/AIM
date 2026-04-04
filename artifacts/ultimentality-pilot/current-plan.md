@@ -69,20 +69,30 @@ Completed in this slice:
    - the current Codex CLI `exec --json` path gives live warnings and coarse lifecycle events immediately
    - it also preserves the final `agent_message` into the live stream state
    - it does not currently appear to emit token-by-token text deltas on this path
+18. Landed the first real resident Codex transport seam:
+   - `splcw-orchestrator` now exposes a dedicated resident-session transport module instead of keeping the transport seam buried inline
+   - `splcw-operator-gui/src/resident_transport.rs` now holds a GUI-side `ResidentCodexTransport` backed by a dedicated resident worker thread
+   - that worker now keeps a real `codex app-server --listen stdio://` process alive across turns instead of pretending `exec/resume` is itself a session runtime
+   - the new resident lane streams `thread/started`, `turn/started`, `item/agentMessage/delta`, tool-like item lifecycle, warnings, and `turn/completed` back into the live operator state
+   - the old `exec --json` path is still retained as a fallback bridge if resident app-server startup or turn execution fails
+19. Verified the resident lane against the real local Codex app-server:
+   - regular `cargo test -p splcw-operator-gui` still passes
+   - added an ignored real-transport probe that exercises `ResidentCodexTransport` directly against the installed logged-in Codex CLI app-server
+   - that ignored probe passed locally, proving the resident transport is not just an abstraction sketch
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
    - keep reducing the remaining stacked dashboard-card behavior
    - make the session lane more live and interactive beyond historical prompt/reply controls
-   - make the new active-turn stream obvious and useful instead of a secondary debug pane
+   - make the resident app-server live stream obvious and useful instead of a secondary debug pane
    - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift
    - decide whether to repair, isolate, or deliberately ignore those warnings in the operator presentation
-3. Decide the next streaming architecture step deliberately:
-   - keep the current `exec --json` lane as the coarse live event stream
-   - or add a resident interactive CLI/PTTY lane if we want true continuously updating reply text
+3. Decide the next resident-session architecture step deliberately:
+   - keep deepening the current `app-server` stdio lane
+   - or move again toward a richer PTY/realtime lane only if `app-server` proves insufficient for truly first-class live text behavior
 4. Only after the operator loop is humane and grounded, continue deeper continuity/substrate work.
 
 ### What Not To Do

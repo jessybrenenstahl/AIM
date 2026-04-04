@@ -16,7 +16,7 @@ use gpui_component::{button::Button, button::ButtonVariants as _};
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_CODEX_ENGINE_LABEL: &str = "Codex CLI";
 const CLI_CODEX_ENGINE_SUMMARY: &str =
-    "Official Codex CLI is the primary engine. The GUI launches real Codex CLI login and `codex exec/resume` turns.";
+    "Official Codex CLI is the primary engine. The GUI now routes prompts through a resident session layer that streams real Codex CLI activity into the workbench.";
 const FALLBACK_PROVIDER_LABEL: &str = "Provider Fallback";
 const FALLBACK_PROVIDER_SUMMARY: &str =
     "This lane exists only as a fallback or debugging path when the primary Codex CLI lane is unavailable.";
@@ -482,6 +482,7 @@ impl OperatorShell {
     }
 
     fn snapshot(&self) -> OperatorSnapshot {
+        self.app.drain_resident_events();
         self.app
             .snapshot
             .lock()
@@ -1160,7 +1161,7 @@ impl OperatorShell {
         let provider_recovery_surface = match self.app.engine_mode {
             OperatorEngineMode::CodexCli if !snapshot.codex_cli_logged_in => empty_state(
                 "Codex CLI login is required",
-                "Use the Auth page to launch `codex login`. Once the CLI is logged in, this panel will use real `codex exec/resume` turns instead of the old native client path.",
+                "Use the Auth page to launch `codex login`. Once the CLI is logged in, this panel will use the resident Codex CLI session lane instead of the old one-shot native client path.",
                 cx,
             ),
             OperatorEngineMode::NativeHarness if provider_retry_needed => empty_state(

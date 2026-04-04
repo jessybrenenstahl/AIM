@@ -1,6 +1,7 @@
 mod compaction_publisher;
 mod gap_task_emitter;
 mod host_verify_retry;
+pub mod resident_transport;
 mod runtime;
 mod session;
 
@@ -32,9 +33,13 @@ pub use runtime::{
     SupervisedGithubActionRequest,
 };
 pub use session::{
-    RuntimeCompactionResult, RuntimeGapRecord, RuntimePendingTurnCheckpoint,
+    AlwaysOnMemory, ResidentSession, RuntimeCompactionResult, RuntimeGapRecord, RuntimePendingTurnCheckpoint,
     RuntimePendingTurnPhase, RuntimeSessionConfig, RuntimeSessionEvent, RuntimeSessionEventKind,
     RuntimeSessionJournal, RuntimeSessionState, RuntimeToolOutcomeRecord, RuntimeTurnRecord,
+};
+pub use resident_transport::{
+    ResidentSessionEvent, ResidentSessionTransport, SessionEvent, SimulatedResidentTransport,
+    create_resident_session_channel,
 };
 
 const MIRROR_VERIFICATION_GAP_TITLE: &str = "Mirror checkpoint drift detected";
