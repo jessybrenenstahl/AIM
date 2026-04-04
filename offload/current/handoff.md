@@ -81,6 +81,11 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - historical Codex reply cards now strip engine/model/session bullets out of the main body and keep them as compact footer metadata
   - raw `## CLI Warnings` sections are no longer dumped into the main session lane
   - live resident cards now summarize warning presence instead of flooding the transcript with Codex-local warning text
+- newest live-progression pass:
+  - the streaming assistant card now reflects resident app-server stage in its title (`starting`, `reading`, `thinking`, `typing`)
+  - empty/live body states now read as active progression instead of static placeholder text
+  - active text now carries a subtle live cursor feel while deltas are still arriving
+  - raw transport event names are translated into friendlier activity labels in the card footer
 - important current boundary:
   - the resident app-server lane is now real
   - the main session lane now foregrounds the live resident stream more naturally

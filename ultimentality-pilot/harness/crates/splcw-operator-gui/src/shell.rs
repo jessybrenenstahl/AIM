@@ -3822,7 +3822,7 @@ fn build_conversation_entries(
                 }
                 entries.push(ConversationEntry {
                     role: ConversationRole::Assistant,
-                    title: "Codex is responding".to_string(),
+                    title: build_live_stream_title(snapshot),
                     body: build_live_stream_body(snapshot),
                     is_draft: false,
                     is_live: true,
@@ -3869,20 +3869,28 @@ fn build_conversation_entries(
 fn build_live_stream_body(snapshot: &OperatorSnapshot) -> String {
     if let Some(text) = snapshot.codex_cli_live_stream_text.as_deref() {
         if !text.trim().is_empty() {
-            return text.trim().to_string();
+            let trimmed = text.trim_end();
+            return format!("{trimmed}{}", live_stream_cursor());
         }
     }
-    "Codex is actively working on the current turn.".to_string()
+    format!("{}{}", build_live_stream_placeholder(snapshot), live_progress_suffix())
 }
 
 fn build_live_stream_footer_lines(snapshot: &OperatorSnapshot) -> Vec<String> {
     let mut lines = Vec::new();
+    lines.push(format!(
+        "Stage: {}",
+        friendly_live_event_label(snapshot.codex_cli_live_stream_events.last())
+    ));
     lines.push("Receiving live deltas from the resident Codex app-server.".to_string());
     if let Some(updated_at) = snapshot.codex_cli_live_stream_updated_at {
         lines.push(format!("Updated {}", updated_at.to_rfc3339()));
     }
     if let Some(event) = snapshot.codex_cli_live_stream_events.last() {
-        lines.push(format!("Latest activity: {event}"));
+        lines.push(format!(
+            "Latest activity: {}",
+            friendly_live_event_label(Some(event))
+        ));
     }
     if !snapshot.codex_cli_live_stream_warnings.is_empty() {
         lines.push(format!(
@@ -3891,6 +3899,101 @@ fn build_live_stream_footer_lines(snapshot: &OperatorSnapshot) -> Vec<String> {
         ));
     }
     lines
+}
+
+fn build_live_stream_title(snapshot: &OperatorSnapshot) -> String {
+    match snapshot.codex_cli_live_stream_events.last() {
+        Some(event) if event.contains("agent_message") || event.contains("agentMessage") => {
+            format!("Codex is typing{}", live_progress_suffix())
+        }
+        Some(event) if event.contains("reasoning") => {
+            format!("Codex is thinking{}", live_progress_suffix())
+        }
+        Some(event) if event.contains("userMessage") => {
+            format!("Codex is reading the prompt{}", live_progress_suffix())
+        }
+        Some(event) if event.contains("turn.started") => {
+            format!("Codex is starting the turn{}", live_progress_suffix())
+        }
+        _ => format!("Codex is responding{}", live_progress_suffix()),
+    }
+}
+
+fn build_live_stream_placeholder(snapshot: &OperatorSnapshot) -> String {
+    match snapshot.codex_cli_live_stream_events.last() {
+        Some(event) if event.contains("agentMessage") || event.contains("agent_message") => {
+            "Streaming reply".to_string()
+        }
+        Some(event) if event.contains("reasoning") => {
+            "Reasoning in progress".to_string()
+        }
+        Some(event) if event.contains("userMessage") => {
+            "Prompt accepted by the resident session".to_string()
+        }
+        Some(event) if event.contains("turn.started") => {
+            "Resident turn started".to_string()
+        }
+        _ => "Codex is actively working on the current turn".to_string(),
+    }
+}
+
+fn live_progress_suffix() -> &'static str {
+    match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 350
+        % 4
+    {
+        0 => ".",
+        1 => "..",
+        2 => "...",
+        _ => "",
+    }
+}
+
+fn live_stream_cursor() -> &'static str {
+    match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 500
+        % 2
+    {
+        0 => " ▍",
+        _ => "",
+    }
+}
+
+fn friendly_live_event_label(event: Option<&String>) -> String {
+    match event {
+        Some(value) if value.contains("agent_message") => "assistant reply delta received".to_string(),
+        Some(value) if value.contains("item.started agentMessage") => {
+            "assistant message started".to_string()
+        }
+        Some(value) if value.contains("item.completed agentMessage") => {
+            "assistant message completed".to_string()
+        }
+        Some(value) if value.contains("item.started reasoning") => {
+            "reasoning started".to_string()
+        }
+        Some(value) if value.contains("item.completed reasoning") => {
+            "reasoning completed".to_string()
+        }
+        Some(value) if value.contains("item.started userMessage") => {
+            "prompt handed to Codex".to_string()
+        }
+        Some(value) if value.contains("item.completed userMessage") => {
+            "prompt accepted".to_string()
+        }
+        Some(value) if value.contains("thread.started") => "resident thread started".to_string(),
+        Some(value) if value.contains("thread.status active") => "thread active".to_string(),
+        Some(value) if value.contains("thread.status idle") => "thread idle".to_string(),
+        Some(value) if value.contains("turn.started") => "turn started".to_string(),
+        Some(value) if value.contains("turn.completed") => "turn completed".to_string(),
+        Some(value) => value.clone(),
+        None => "awaiting resident activity".to_string(),
+    }
 }
 
 fn parse_conversation_reply(reply: &str) -> ParsedConversationReply {

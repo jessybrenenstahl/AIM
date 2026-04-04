@@ -88,6 +88,11 @@ Completed in this slice:
    - stored CLI reply cards now strip engine/session header bullets out of the main body and move them into compact footer metadata
    - raw `## CLI Warnings` sections are no longer dumped into the main conversation body
    - live resident cards now summarize warning presence instead of flooding the transcript with Codex-local warning text
+22. Added more active progression to the resident live card:
+   - the streaming assistant card now changes title based on resident app-server activity (`starting`, `reading`, `thinking`, `typing`)
+   - live placeholder text now reflects the current stage instead of staying static
+   - active reply text now gets a subtle live cursor/progress feel while deltas are arriving
+   - footer activity now uses friendlier event labels instead of raw transport event strings
 
 ### Immediate Next Work
 

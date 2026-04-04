@@ -2,8 +2,8 @@
 
 - lead gap: the AIM operator now has a true resident `codex app-server` lane and the main session lane foregrounds live replies better, but the overall transcript/composer rhythm still does not feel as cohesive or polished as OpenClaw, RustyClaw, or Opencode
 - the merged session workspace is a meaningful step, and the CLI lane now shows real prompt/reply history plus live streaming cards, but the Operate page still needs stronger chat-like rhythm and richer live interaction to feel fully human-usable
-- the new session lane now supports draft reuse, append, prompt restoration, rerunning historical prompts, cleaner historical reply bodies, and clearer live streaming cards, but it still needs richer in-lane interaction than prompt-control actions alone
-- the resident app-server stream now carries true `item/agentMessage/delta` chunks and is treated as the main conversation substrate, but the shell still needs a stronger sense of active typing/progression while those deltas arrive
+- the new session lane now supports draft reuse, append, prompt restoration, rerunning historical prompts, cleaner historical reply bodies, stage-aware live streaming cards, and clearer live activity language, but it still needs richer in-lane interaction than prompt-control actions alone
+- the resident app-server stream now carries true `item/agentMessage/delta` chunks and is treated as the main conversation substrate, and the live card now feels more active, but the shell still needs an even stronger sense of continuous typing/progression while those deltas arrive
 - the structured proof panel is a better proof surface, but the inspector lane still needs to feel more like a polished product panel and less like stacked diagnostics
 - warning/proof hygiene is better, but the operator still needs a cleaner strategy for surfacing Codex-local warnings without making the product feel noisy or brittle
 - the grounded CLI turn is now real and persisted, but the operator still surfaces noisy Codex-local warnings about `C:\Users\jessy\.codex\state_5.sqlite` migrations and PowerShell shell snapshots
