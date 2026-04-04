@@ -86,6 +86,10 @@ Reason for clean slate: architectural drift toward GUI-first / native-Codex-engi
   - empty/live body states now read as active progression instead of static placeholder text
   - active text now carries a subtle live cursor feel while deltas are still arriving
   - raw transport event names are translated into friendlier activity labels in the card footer
+- newest warning-hygiene pass:
+  - `Turn Activity` now summarizes live warnings by known category instead of dumping raw warning walls
+  - `Codex Connection` now includes an `Environment Notes` surface that summarizes recurring Codex-local noise in calmer product language
+  - known local warnings remain visible, but they no longer dominate the main operator surfaces
 - important current boundary:
   - the resident app-server lane is now real
   - the main session lane now foregrounds the live resident stream more naturally

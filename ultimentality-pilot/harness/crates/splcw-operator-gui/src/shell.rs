@@ -2997,6 +2997,18 @@ fn render_codex_cli_connection_panel(
                 cx,
             ),
         )
+        .child(
+            document_surface(
+                "engine-identity-environment-notes",
+                build_codex_warning_summary_markdown(snapshot),
+                zoom_scale,
+                8.0,
+                Some(12.0),
+                DocumentSurfaceMode::Scroll,
+                window,
+                cx,
+            ),
+        )
         .into_any_element()
 }
 
@@ -3340,15 +3352,7 @@ fn build_active_turn_stream_markdown(snapshot: &OperatorSnapshot) -> String {
         ));
     }
     if !snapshot.codex_cli_live_stream_warnings.is_empty() {
-        sections.push(format!(
-            "## Live warnings\n\n{}",
-            snapshot
-                .codex_cli_live_stream_warnings
-                .iter()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
+        sections.push(build_codex_warning_section(&snapshot.codex_cli_live_stream_warnings));
     }
     sections.join("\n\n")
 }
@@ -3893,12 +3897,123 @@ fn build_live_stream_footer_lines(snapshot: &OperatorSnapshot) -> Vec<String> {
         ));
     }
     if !snapshot.codex_cli_live_stream_warnings.is_empty() {
-        lines.push(format!(
-            "{} Codex-local warning(s) hidden from the session lane. See Turn Activity for details.",
-            snapshot.codex_cli_live_stream_warnings.len()
-        ));
+        let known_warning_count = snapshot
+            .codex_cli_live_stream_warnings
+            .iter()
+            .filter(|warning| classify_codex_warning(warning).1)
+            .count();
+        if known_warning_count == snapshot.codex_cli_live_stream_warnings.len() {
+            lines.push(format!(
+                "{} known local Codex environment warning(s) hidden from the session lane. See Turn Activity for details.",
+                known_warning_count
+            ));
+        } else {
+            lines.push(format!(
+                "{} Codex-local warning(s) hidden from the session lane. See Turn Activity for details.",
+                snapshot.codex_cli_live_stream_warnings.len()
+            ));
+        }
     }
     lines
+}
+
+fn build_codex_warning_summary_markdown(snapshot: &OperatorSnapshot) -> String {
+    let warnings = collect_recent_codex_warning_lines(snapshot);
+    if warnings.is_empty() {
+        return "# Environment Notes\n\n- No recent Codex-local warnings recorded.".to_string();
+    }
+    let summary_lines = summarize_codex_warning_lines(&warnings);
+    format!(
+        "# Environment Notes\n\n{}\n\n- Raw warning text is intentionally collapsed in the GUI and preserved in the underlying artifacts.",
+        summary_lines
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn build_codex_warning_section(warnings: &[String]) -> String {
+    format!(
+        "## Warning Summary\n\n{}\n\n- Raw warning text is intentionally collapsed here so the inspector stays readable.",
+        summarize_codex_warning_lines(warnings)
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn collect_recent_codex_warning_lines(snapshot: &OperatorSnapshot) -> Vec<String> {
+    let mut warnings = std::collections::BTreeSet::new();
+    for reply in snapshot.codex_cli_recent_turn_replies.iter().rev().take(3) {
+        for warning in extract_codex_warning_lines(reply) {
+            warnings.insert(warning);
+        }
+    }
+    for warning in &snapshot.codex_cli_live_stream_warnings {
+        warnings.insert(warning.clone());
+    }
+    warnings.into_iter().collect()
+}
+
+fn extract_codex_warning_lines(reply: &str) -> Vec<String> {
+    reply
+        .split_once("## CLI Warnings")
+        .map(|(_, warnings_block)| {
+            warnings_block
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("- "))
+                .map(|line| line.trim_start_matches("- ").to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn summarize_codex_warning_lines(warnings: &[String]) -> Vec<String> {
+    let mut grouped = std::collections::BTreeMap::<String, usize>::new();
+    let mut unknown_examples = Vec::new();
+    for warning in warnings {
+        let (label, known_local) = classify_codex_warning(warning);
+        if known_local {
+            *grouped.entry(label.to_string()).or_default() += 1;
+        } else if unknown_examples.len() < 3 {
+            unknown_examples.push(label.to_string());
+        }
+    }
+
+    let mut lines = grouped
+        .into_iter()
+        .map(|(label, count)| format!("{label}: {count} occurrence(s)"))
+        .collect::<Vec<_>>();
+
+    if !unknown_examples.is_empty() {
+        lines.push(format!(
+            "Needs review: {}",
+            unknown_examples.join(" | ")
+        ));
+    }
+
+    if lines.is_empty() {
+        lines.push("Warnings were present, but none were classified yet.".to_string());
+    }
+
+    lines
+}
+
+fn classify_codex_warning(warning: &str) -> (&str, bool) {
+    if warning.contains("state_5.sqlite")
+        || warning.contains("migration 21 was previously applied but is missing")
+    {
+        ("Local Codex state DB mismatch", true)
+    } else if warning.contains("find_thread_path_by_id_str_in_subdir: falling_back") {
+        ("Codex state DB fallback path", true)
+    } else if warning.contains("Shell snapshot not supported yet for PowerShell") {
+        ("PowerShell shell snapshot unsupported", true)
+    } else {
+        (warning, false)
+    }
 }
 
 fn build_live_stream_title(snapshot: &OperatorSnapshot) -> String {

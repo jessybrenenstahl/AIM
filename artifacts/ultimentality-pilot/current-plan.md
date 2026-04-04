@@ -93,15 +93,19 @@ Completed in this slice:
    - live placeholder text now reflects the current stage instead of staying static
    - active reply text now gets a subtle live cursor/progress feel while deltas are arriving
    - footer activity now uses friendlier event labels instead of raw transport event strings
+23. Productized the remaining Codex-local warning surfaces:
+   - `Turn Activity` now shows a classified warning summary instead of dumping raw warning walls
+   - `Codex Connection` now has a dedicated `Environment Notes` surface that summarizes recurring local Codex noise in human terms
+   - known local warnings such as the state DB mismatch and PowerShell shell snapshot limitation are still visible, but they no longer dominate the operator workbench
 
 ### Immediate Next Work
 
 1. Keep reworking the GPUI shell toward a real workbench:
-   - keep reducing the remaining stacked dashboard-card behavior
-   - make the session lane more live and interactive beyond historical prompt/reply controls
-   - keep deepening the resident app-server stream so it feels like a first-class conversation, not just a better live card
-   - continue separating proof/telemetry from reply content so the transcript stays humane under long-running use
-   - make proof, grounding, and recovery read like an inspector lane instead of a second dashboard
+    - keep reducing the remaining stacked dashboard-card behavior
+    - make the session lane more live and interactive beyond historical prompt/reply controls
+    - keep deepening the resident app-server stream so it feels like a first-class conversation, not just a better live card
+    - continue separating proof/telemetry from reply content so the transcript stays humane under long-running use
+    - make proof, grounding, recovery, and environment notes read like a cohesive inspector lane instead of scattered diagnostics
 2. Reduce operator friction around the live Codex CLI warnings:
    - investigate `C:\Users\jessy\.codex\state_5.sqlite` migration drift
    - decide whether to repair, isolate, or deliberately ignore those warnings in the operator presentation
